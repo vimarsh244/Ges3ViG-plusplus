@@ -11,6 +11,7 @@ from abc import abstractmethod
 from torch.utils.data import Dataset
 import open3d as o3d
 import pickle
+from ges3vig.data.dataset.corruption import apply_pointcloud_corruption
 np.set_printoptions(threshold=sys.maxsize)
 class GeneralMultiImputedDataset(Dataset):
     def __init__(self, data_cfg=None, split="train"):
@@ -82,9 +83,10 @@ class GeneralMultiImputedDataset(Dataset):
 
             scene_path = os.path.join(scene_data_path, self.split+"_imputed", f"{scene_id}.pth")
             try:
-                scene_data = torch.load(scene_path)
+                scene_data = torch.load(scene_path, weights_only=False)
             except Exception as e:
                 print(f"Errored in scene: {scene_id} \n{e}")
+                continue
             scene_data["rgb"] = scene_data["rgb"].astype(np.float32) / 127.5 - 1  # scale rgb to [-1, 1]
             self.all_scene_data[scene_id] = scene_data
 
@@ -235,7 +237,14 @@ class GeneralMultiImputedDataset(Dataset):
             scene_data["aabb_obj_ids"] = np.concatenate([scene_data["aabb_obj_ids"],np.array([instance_id])])
             data_dict["human_lr_label"] = torch.tensor([0]) if lr=='left' else torch.tensor([1])
             data_dict["has_human"] = torch.tensor([True])
-       
+
+        # Optional robustness corruption (noise / partial capture). No-op unless
+        # data.eval_corruption.enabled is set; GT boxes are never touched.
+        scene_data = apply_pointcloud_corruption(
+            scene_data, self.data_cfg.get("eval_corruption", None), self.split, scene_id,
+            use_multiview=self.data_cfg.point_features.use_multiview,
+        )
+
         scene_center_xyz = scene_data["xyz"].mean(axis=0)
 
         original_num_points = scene_data["xyz"].shape[0]

@@ -1,0 +1,33 @@
+# Managed by Hydra
+# NoHumanImputeRefer: ImputeRefer ablation with NO HUMAN injected into the scene.
+# Use this config to measure model accuracy when gesture/human cues are absent.
+# Same scenes and LLM-generated language as ImputeRefer, but the human mesh is
+# never added - the model must rely entirely on language + 3D/2D visual features.
+
+defaults:
+  - scannetv2
+  - human   # provides human_dir (unused at runtime, but keeps config schema consistent)
+
+lang_dataset: NoHumanImputeRefer
+lang_dataset_path: ${data.data_root_path}/imputerefer
+
+lang_metadata:
+  metadata_root_path: ${data.lang_dataset_path}/metadata
+  train_language_data: ${data.lang_metadata.metadata_root_path}/PointRefer_filtered_train_final_k.json
+  val_language_data: ${data.lang_metadata.metadata_root_path}/PointRefer_filtered_val_final_k.json
+  test_language_data: ${data.lang_metadata.metadata_root_path}/ScanRefer_filtered_test.json
+
+chunk_size: 1
+
+evaluator:
+  _target_: ges3vig.evaluation.scanrefer_evaluator.ScanReferEvaluator
+  verbose: True
+  metric_name: accuracy
+
+monitor_value: accuracy@0.5_overall
+
+# human_perturbation_percentage is required by the base config schema but unused here
+human_perturbation_percentage: 0
+
+# Filter by eval_type: null (all), "unique", "multiple"
+eval_type_filter: null

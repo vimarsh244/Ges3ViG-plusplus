@@ -1,0 +1,33 @@
+# Managed by Hydra
+
+defaults:
+  - scannetv2
+  - human
+
+lang_dataset: ImputeReferRealHumans
+lang_dataset_path: ${data.data_root_path}/imputerefer
+
+# Use cleaned real-human assets (prepared by tools/prepare_real_humans_dataset.py)
+human_dir: ${data.data_root_path}/humans_real
+real_human_names: [grace, parth, nilesh, saransh, vim]
+real_human_scale: 1.0
+# keep real-human density close to scene density
+max_human_points_train: 40000
+max_human_points_eval: 25000
+
+lang_metadata:
+  metadata_root_path: ${data.lang_dataset_path}/metadata
+  train_language_data: ${data.lang_metadata.metadata_root_path}/PointRefer_filtered_train_final_k.json
+  val_language_data: ${data.lang_metadata.metadata_root_path}/PointRefer_filtered_val_final_k.json
+  test_language_data: ${data.lang_metadata.metadata_root_path}/ScanRefer_filtered_test.json
+
+chunk_size: 1
+
+evaluator:
+  _target_: ges3vig.evaluation.scanrefer_evaluator.ScanReferEvaluator
+  verbose: True
+  metric_name: accuracy
+
+monitor_value: accuracy@0.5_overall
+
+human_perturbation_percentage: 5

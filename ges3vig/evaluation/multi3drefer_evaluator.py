@@ -4,8 +4,8 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from scipy.optimize import linear_sum_assignment
-from m3drefclip.util.utils import get_batch_aabb_pair_ious
-from m3drefclip.evaluation.general_evaluator import GeneralEvaluator
+from ges3vig.util.utils import get_batch_aabb_pair_ious
+from ges3vig.evaluation.general_evaluator import GeneralEvaluator
 
 
 class Multi3DReferEvaluator(GeneralEvaluator):

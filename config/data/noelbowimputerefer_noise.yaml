@@ -1,0 +1,24 @@
+# Managed by Hydra
+# Robustness-evaluation variant of noelbowimputerefer.yaml (OLD no-elbow loader).
+# See imputerefer_noise.yaml for usage and CLI override examples.
+#
+#   python test.py data=noelbowimputerefer_noise ckpt_path=<ckpt> data.inference.split=val
+
+defaults:
+  - noelbowimputerefer
+
+eval_corruption:
+  enabled: True
+  noise:                 # Q7
+    enabled: True
+    sigma: 0.02
+  partial:               # Q8 (off by default here; flip enabled to use)
+    enabled: False
+    mode: dropout
+    keep_ratio: 0.5
+
+evaluator:
+  _target_: ges3vig.evaluation.noise_injection_evaluator.NoiseInjectionEvaluator
+  verbose: True
+  metric_name: accuracy
+  corruption_cfg: ${data.eval_corruption}

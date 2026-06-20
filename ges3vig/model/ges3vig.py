@@ -39,7 +39,7 @@ class Ges3Vig(pl.LightningModule):
         # loss
         #if self.train_pg:
             #return
-        if self.dataset_name in ("ScanRefer", "Nr3D", "ImputedScanRefer", "PointRefer", "ImputeRefer"):
+        if self.dataset_name in ("ScanRefer", "Nr3D", "ImputedScanRefer", "PointRefer", "ImputeRefer", "NoElbowImputeRefer", "NoHumanImputeRefer", "ImputeReferRealHumans"):
             self.ref_loss = hydra.utils.instantiate(
                 cfg.model.loss.reference_ce_loss, chunk_size=cfg.data.chunk_size,
                 max_num_proposals=cfg.model.network.max_num_proposals
@@ -323,11 +323,24 @@ class Ges3Vig(pl.LightningModule):
             total_pred_results.update(pred_results)
             total_gt_results.update(gt_results)
         self.val_test_step_outputs.clear()
+
+        # Compute + print the IoU evaluation (Acc@0.25 / Acc@0.50) for splits that
+        # carry ground truth (val). Wrapped so the unlabeled benchmark `test`
+        # split still just saves predictions without crashing.
+        try:
+            self.evaluator.set_ground_truths(total_gt_results)
+            results = self.evaluator.evaluate(total_pred_results)
+            for metric_name, result in results.items():
+                for breakdown, value in result.items():
+                    self.log(f"test_eval/{metric_name}_{breakdown}", value)
+        except Exception as e:
+            print(f"[on_test_epoch_end] skipped IoU evaluation ({type(e).__name__}: {e})")
+
         self._save_predictions(total_pred_results)
 
     def _parse_pred_results(self, data_dict, output_dict):
         batch_size, lang_chunk_size = data_dict["ann_id"].shape
-        if self.dataset_name in ("ScanRefer", "Nr3D", "ImputedScanRefer", "PointRefer", "ImputeRefer"):
+        if self.dataset_name in ("ScanRefer", "Nr3D", "ImputedScanRefer", "PointRefer", "ImputeRefer", "NoElbowImputeRefer", "NoHumanImputeRefer", "ImputeReferRealHumans"):
             pred_aabb_score_masks = (output_dict["pred_aabb_scores"].argmax(dim=1)).reshape(
                 shape=(batch_size, lang_chunk_size, -1)
             )
@@ -354,18 +367,56 @@ class Ges3Vig(pl.LightningModule):
         batch_size, lang_chunk_size = data_dict["ann_id"].shape
         gts = {}
         gt_target_obj_id_masks = data_dict["gt_target_obj_id_mask"].permute(1, 0)
+        # Precompute per-sample human centre (mid-shoulder) so the distance
+        # evaluator can bucket IoU by human<->target distance. Safe no-op when
+        # there is no human (e.g. NoHumanImputeRefer) or joints are missing.
+        human_centers = None
+        if "human_joint_matrix" in data_dict and "joint_name_idx_map" in data_dict:
+            human_centers = []
+            for i in range(batch_size):
+                joint_map = data_dict["joint_name_idx_map"][i]
+                joint_matrix = data_dict["human_joint_matrix"][i]
+                if "left_shoulder" in joint_map and "right_shoulder" in joint_map:
+                    human_center = (joint_matrix[joint_map["left_shoulder"]] +
+                                    joint_matrix[joint_map["right_shoulder"]]) / 2
+                elif "left_shoulder" in joint_map:
+                    human_center = joint_matrix[joint_map["left_shoulder"]]
+                elif "right_shoulder" in joint_map:
+                    human_center = joint_matrix[joint_map["right_shoulder"]]
+                else:
+                    human_center = joint_matrix.mean(dim=0)
+                human_centers.append(human_center)
         for i in range(batch_size):
             aabb_start_idx = data_dict["aabb_count_offsets"][i]
             aabb_end_idx = data_dict["aabb_count_offsets"][i + 1]
             for j in range(lang_chunk_size):
+                gt_mask = gt_target_obj_id_masks[j][aabb_start_idx:aabb_end_idx]
+                gt_aabb_local = data_dict["gt_aabb_min_max_bounds"][aabb_start_idx:aabb_end_idx][gt_mask]
+                gt_aabb_bound = (gt_aabb_local + data_dict["scene_center_xyz"][i]).cpu().numpy()
+                # distance from human to GT object centre (for distance evaluator)
+                distance = None
+                if human_centers is not None and gt_aabb_local.shape[0] > 0:
+                    gt_center = gt_aabb_local[0].mean(dim=0)
+                    distance = torch.norm(gt_center - human_centers[i]).item()
+                # arm (elbow) angle used when composing this sample (for angle evaluator)
+                arm_angle = None
+                if "arm_angle" in data_dict:
+                    try:
+                        arm_angle_raw = data_dict["arm_angle"][i]
+                        if isinstance(arm_angle_raw, list):
+                            arm_angle = arm_angle_raw[j] if j < len(arm_angle_raw) else None
+                        else:
+                            arm_angle = arm_angle_raw
+                    except (IndexError, TypeError):
+                        arm_angle = None
                 gts[
                     (data_dict["scene_id"][i], data_dict["object_id"][i][j].item(),
                      data_dict["ann_id"][i][j].item())
                 ] = {
-                    "aabb_bound":
-                        (data_dict["gt_aabb_min_max_bounds"][aabb_start_idx:aabb_end_idx][gt_target_obj_id_masks[j]
-                    [aabb_start_idx:aabb_end_idx]] + data_dict["scene_center_xyz"][i]).cpu().numpy(),
-                    "eval_type": data_dict["eval_type"][i][j]
+                    "aabb_bound": gt_aabb_bound,
+                    "eval_type": data_dict["eval_type"][i][j],
+                    "distance": distance,
+                    "arm_angle": arm_angle,
                 }
         return gts
 
@@ -386,7 +437,7 @@ class Ges3Vig(pl.LightningModule):
                     for z in [min_point[2], max_point[2]]
                 ], dtype=np.float32)
 
-            if self.dataset_name in ("ScanRefer", "Nr3D", "ImputedScanRefer", "PointRefer", "ImputeRefer"):
+            if self.dataset_name in ("ScanRefer", "Nr3D", "ImputedScanRefer", "PointRefer", "ImputeRefer", "NoElbowImputeRefer", "NoHumanImputeRefer", "ImputeReferRealHumans"):
                 scene_pred[scene_id].append({
                     "object_id": key[1],
                     "ann_id": key[2],

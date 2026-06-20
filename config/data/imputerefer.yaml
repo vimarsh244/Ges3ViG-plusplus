@@ -24,3 +24,6 @@ monitor_value: accuracy@0.5_overall
 
 human_perturbation_percentage: 5
 
+# Filter by eval_type: null (all), "unique", "multiple"
+eval_type_filter: null
+

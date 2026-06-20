@@ -1,0 +1,30 @@
+# Managed by Hydra
+# Robustness-evaluation variant of imputerefer.yaml.
+# Identical data, but the input point cloud is corrupted (Q7 noise / Q8 partial)
+# and the NoiseInjectionEvaluator is used so the run is self-documenting.
+#
+# Usage:
+#   python test.py data=imputerefer_noise ckpt_path=<ckpt> data.inference.split=val
+# Override the severity on the CLI, e.g. a sigma sweep:
+#   ... data.eval_corruption.noise.sigma=0.05
+#   ... data.eval_corruption.noise.enabled=false \
+#       data.eval_corruption.partial.enabled=true data.eval_corruption.partial.keep_ratio=0.5
+
+defaults:
+  - imputerefer
+
+eval_corruption:
+  enabled: True
+  noise:                 # Q7
+    enabled: True
+    sigma: 0.02
+  partial:               # Q8 (off by default here; flip enabled to use)
+    enabled: False
+    mode: dropout
+    keep_ratio: 0.5
+
+evaluator:
+  _target_: ges3vig.evaluation.noise_injection_evaluator.NoiseInjectionEvaluator
+  verbose: True
+  metric_name: accuracy
+  corruption_cfg: ${data.eval_corruption}

@@ -4,6 +4,7 @@ import lightning.pytorch as pl
 from importlib import import_module
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
+from time import perf_counter
 
 
 class DataModule(pl.LightningDataModule):
@@ -13,34 +14,73 @@ class DataModule(pl.LightningDataModule):
         dataset_name = data_cfg.lang_dataset
         self.dataset = getattr(import_module(f"ges3vig.data.dataset.{dataset_name.lower()}"), dataset_name)
 
+        # Disable pin_memory on Jetson / unified-memory platforms (wastes memory)
+        self._pin_memory = not self._is_unified_memory()
+
     def setup(self, stage=None):
         if stage == "fit":
             self.train_set = self.dataset(self.data_cfg, "train")
-            self.val_set = self.dataset(self.data_cfg, "test")
+            self.val_set = self.dataset(self.data_cfg, "val")
         if stage == "test":
             self.test_set = self.dataset(self.data_cfg, self.data_cfg.inference.split)
         if stage == "predict":
             self.test_set = self.dataset(self.data_cfg, "test")
 
+    @staticmethod
+    def _is_unified_memory() -> bool:
+        """Detect Jetson / unified-memory platforms where pin_memory is wasteful."""
+        import platform
+        if platform.machine() in ("aarch64", "arm64"):
+            try:
+                with open("/proc/device-tree/model", "r") as f:
+                    model = f.read().lower()
+                if "jetson" in model or "nvidia" in model:
+                    return True
+            except (FileNotFoundError, PermissionError):
+                pass
+            # Fallback: if GPU total ≈ system RAM total, it's unified memory
+            try:
+                if torch.cuda.is_available():
+                    gpu_mem = torch.cuda.get_device_properties(0).total_mem
+                    with open("/proc/meminfo") as f:
+                        for line in f:
+                            if line.startswith("MemTotal:"):
+                                sys_mem = int(line.split()[1]) * 1024  # kB → bytes
+                                # If GPU mem is ≥ 50% of system RAM, likely unified
+                                if gpu_mem >= sys_mem * 0.5:
+                                    return True
+                                break
+            except Exception:
+                pass
+        return False
+
     def train_dataloader(self):
         #self.train_set.shuffle_chunks()  # shuffle language data chunks after each epoch
-        return DataLoader(self.train_set, batch_size=self.data_cfg.dataloader.batch_size, shuffle=True, pin_memory=True,
+        return DataLoader(self.train_set, batch_size=self.data_cfg.dataloader.batch_size, shuffle=True, pin_memory=self._pin_memory,
                           collate_fn=_collate_fn, num_workers=self.data_cfg.dataloader.num_workers, drop_last=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_set, batch_size=self.data_cfg.dataloader.batch_size, pin_memory=True,
+        return DataLoader(self.val_set, batch_size=self.data_cfg.dataloader.batch_size, pin_memory=self._pin_memory,
                           collate_fn=_collate_fn, num_workers=self.data_cfg.dataloader.num_workers)
 
     def test_dataloader(self):
-        return DataLoader(self.test_set, batch_size=self.data_cfg.dataloader.batch_size, pin_memory=True,
+        return DataLoader(self.test_set, batch_size=self.data_cfg.dataloader.batch_size, pin_memory=self._pin_memory,
                           collate_fn=_collate_fn, num_workers=self.data_cfg.dataloader.num_workers)
 
     def predict_dataloader(self):
-        return DataLoader(self.test_set, batch_size=self.data_cfg.dataloader.batch_size, pin_memory=True,
+        return DataLoader(self.test_set, batch_size=self.data_cfg.dataloader.batch_size, pin_memory=self._pin_memory,
                           collate_fn=_collate_fn, num_workers=self.data_cfg.dataloader.num_workers)
 
 
 def _collate_fn(batch):
+    collate_start = perf_counter()
+    # Filter out None values (samples that couldn't be loaded)
+    batch = [b for b in batch if b is not None]
+    
+    # If all samples were None, return None
+    if len(batch) == 0:
+        return None
+    
     data_dict = {}
 
     # default collation
@@ -55,6 +95,7 @@ def _collate_fn(batch):
     data_dict["aabb_count_offsets"] = torch.zeros(size=(len(batch) + 1,), dtype=torch.int32)
     data_dict["all_point_count_offsets"] = torch.zeros(size=(len(batch) + 1,), dtype=torch.int32)
     data_dict["eval_type"] = []
+    data_dict["arm_angle"] = []
 
     vert_batch_ids = []
     #data_dict["human_keypoints"] = torch.empty((0,2,3))
@@ -71,6 +112,7 @@ def _collate_fn(batch):
         data_dict["point_count_offsets"][i + 1] = point_count_total
         data_dict["aabb_count_offsets"][i + 1] = aabb_count_total
         data_dict["eval_type"].append(b["eval_type"])
+        data_dict["arm_angle"].append(b.get("arm_angle", [None]))
         #data_dict["human_keypoints"] = torch.cat([data_dict["human_keypoints"], b['human_keypoints'][None]])
         #data_dict["has_human"] = torch.cat([data_dict["has_human"], b['has_human'][None]])
         vert_batch_ids.append(
@@ -159,8 +201,25 @@ def _collate_fn(batch):
     data_dict["has_human"] = torch.cat(has_human)
     data_dict["instance_num_point"] = torch.cat(instance_num_point, dim=0)
 
+    sparse_collate_start = perf_counter()
     data_dict["voxel_xyz"], data_dict["voxel_features"] = ME.utils.sparse_collate(
         coords=voxel_xyz_list, feats=voxel_features_list
     )
+    sparse_collate_ms = (perf_counter() - sparse_collate_start) * 1000.0
     data_dict["voxel_point_map"] = torch.cat(voxel_point_map_list, dim=0)
+
+    sample_timing_list = [b.get("timing_data", {}) for b in batch]
+    sample_timing_avg = {}
+    if sample_timing_list and any(sample_timing_list):
+        all_keys = sorted({k for timing in sample_timing_list for k in timing.keys()})
+        for key in all_keys:
+            vals = [float(timing[key]) for timing in sample_timing_list if key in timing]
+            if vals:
+                sample_timing_avg[key] = sum(vals) / len(vals)
+
+    data_dict["timing_data"] = {
+        "collate_total_ms": (perf_counter() - collate_start) * 1000.0,
+        "collate_sparse_ms": sparse_collate_ms,
+        "sample_timing_avg_ms": sample_timing_avg,
+    }
     return data_dict

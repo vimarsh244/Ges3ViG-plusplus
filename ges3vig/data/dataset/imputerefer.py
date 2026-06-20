@@ -19,6 +19,13 @@ class ImputeRefer(GeneralMultiImputedDataset):
         with open(file_path, "r") as f:
             raw_data = json.load(f)
 
+        # Optional filtering by eval_type
+        eval_type_filter = getattr(self.data_cfg, "eval_type_filter", None)
+        if eval_type_filter:
+            print(f"Filtering by eval_type: {eval_type_filter}")
+            raw_data = [item for item in raw_data if item.get("eval_type") == eval_type_filter]
+            print(f"Filtered data: {len(raw_data)} samples")
+
         self.language_data = {}
         scene_ids = {}
         for item in raw_data:
@@ -55,6 +62,10 @@ class ImputeRefer(GeneralMultiImputedDataset):
         data_dict["clip_tokens"] = torch.empty(size=(self.data_cfg.chunk_size, 77), dtype=torch.int32)
         data_dict["eval_type"] = []
 
+        # preserve arm_angle scalar from parent __getitem__ before overwriting
+        parent_arm_angle = data_dict.get("arm_angle", None)
+        data_dict["arm_angle"] = []
+
         for i, index in enumerate(language_data_indices):
             real_idx = index % num_language_data_in_scene  # pad the last chunk
             data = language_data_in_scene[real_idx]
@@ -63,4 +74,5 @@ class ImputeRefer(GeneralMultiImputedDataset):
             data_dict["gt_target_obj_id_mask"][i] = np.in1d(data_dict["gt_aabb_obj_ids"], data["object_id"])
             data_dict["clip_tokens"][i] = data["clip_tokens"]
             data_dict["eval_type"].append(data["eval_type"])
+            data_dict["arm_angle"].append(parent_arm_angle)
         return data_dict

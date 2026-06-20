@@ -15,7 +15,7 @@ lang_metadata:
 chunk_size: 8
 
 evaluator:
-  _target_: m3drefclip.evaluation.multi3drefer_evaluator.Multi3DReferEvaluator
+  _target_: ges3vig.evaluation.multi3drefer_evaluator.Multi3DReferEvaluator
   verbose: False
   metric_name: f1
 

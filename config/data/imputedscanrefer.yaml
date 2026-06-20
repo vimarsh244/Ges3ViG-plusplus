@@ -16,7 +16,7 @@ lang_metadata:
 chunk_size: 1
 
 evaluator:
-  _target_: m3drefclip.evaluation.scanrefer_evaluator.ScanReferEvaluator
+  _target_: ges3vig.evaluation.scanrefer_evaluator.ScanReferEvaluator
   verbose: True
   metric_name: accuracy
 

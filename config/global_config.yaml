@@ -7,13 +7,15 @@ hydra:
 
 defaults:
   - _self_
-  - model: m3dref_clip
+  - model: ges3vig
   - data: base
   - override hydra/hydra_logging: disabled
   - override hydra/job_logging: disabled
 
 project_root_path: ${hydra:runtime.cwd}
-experiment_output_path: ${project_root_path}/output/${data.lang_dataset}/${experiment_name}
+# Shared location for dataset / checkpoints / output (symlinks into the canonical repo).
+common_root_path: /nas_hcfc/HRI_general/common
+experiment_output_path: ${common_root_path}/output/${data.lang_dataset}/${experiment_name}
 pred_path: ${experiment_output_path}/inference
 
 ckpt_path: null
@@ -42,6 +44,7 @@ trainer:
   profiler: simple
   precision: 32
   reload_dataloaders_every_n_epochs: 1  # for shuffling language data chunks
+  limit_test_batches: 1.0  # 1.0 = full set; int = #batches, float = fraction (quick subset eval)
 
 # https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.callbacks.ModelCheckpoint.html
 checkpoint_monitor:

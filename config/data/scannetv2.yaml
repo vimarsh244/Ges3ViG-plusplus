@@ -34,3 +34,28 @@ point_features:
   use_rgb: True
   use_normal: False
   use_multiview: False
+
+# Robustness-evaluation corruption of the input point cloud.
+# DISABLED by default -> every dataset behaves exactly as before.
+# Enable it (usually via a *_noise.yaml config or CLI overrides) to emulate:
+#   noise   (Q7) - additive Gaussian sensor noise over the whole cloud
+#   partial (Q8) - partial / incomplete capture (occlusion, dropout, frustum)
+# Ground-truth boxes are NEVER corrupted, so IoU stays meaningful.
+eval_corruption:
+  enabled: False
+  seed: 42
+  apply_on_train: False     # training set is never corrupted unless this is True
+  noise:                    # Q7
+    enabled: False
+    sigma: 0.0              # stddev (meters) of Gaussian xyz jitter
+    mu: 0.0                # systematic coordinate bias (miscalibration)
+    mode: isotropic        # isotropic | normal (noise along surface normal ~ depth error)
+    rgb_sigma: 0.0         # stddev of Gaussian colour noise in [-1, 1] space
+  partial:                  # Q8
+    enabled: False
+    mode: dropout          # dropout | frustum | occlusion
+    keep_ratio: 1.0        # dropout: fraction of points kept
+    fov_deg: 90.0          # frustum: horizontal field of view
+    max_range: null        # frustum: max sensor range in meters (null = unlimited)
+    num_boxes: 1           # occlusion: number of occluder boxes
+    box_frac: 0.2          # occlusion: box size as fraction of scene extent

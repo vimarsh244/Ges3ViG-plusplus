@@ -1,6 +1,7 @@
 # Managed by Hydra
 
-data_root_path: ${project_root_path}/dataset
+# Data lives in the shared common folder (symlinked to the canonical dataset).
+data_root_path: ${common_root_path}/dataset
 
 dataloader:
   batch_size: 6

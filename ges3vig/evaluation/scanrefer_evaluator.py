@@ -58,11 +58,28 @@ class ScanReferEvaluator(GeneralEvaluator):
         # initialize true positives
         iou_25_tp = 0
         iou_50_tp = 0
+        def _to_aabb_tensor(aabb):
+            t = torch.as_tensor(aabb)
+            if t.numel() == 0:
+                return None
+            if t.ndim == 1:
+                if t.numel() == 6:
+                    t = t.view(2, 3)
+                else:
+                    return None
+            if t.ndim == 2 and t.shape == (2, 3):
+                t = t.unsqueeze(0)
+            if t.ndim != 3 or t.shape[-2:] != (2, 3):
+                return None
+            return t
 
         # TODO: convert to batch process
-        iou = get_batch_aabb_pair_ious(
-            torch.from_numpy(pred_info["aabb_bound"]), torch.from_numpy(gt_info["aabb_bound"])
-        )[0].item()
+        pred_aabb = _to_aabb_tensor(pred_info["aabb_bound"])
+        gt_aabb = _to_aabb_tensor(gt_info["aabb_bound"])
+        # skip invalid boxes
+        if pred_aabb is None or gt_aabb is None:
+            return iou_25_tp, iou_50_tp
+        iou = get_batch_aabb_pair_ious(pred_aabb, gt_aabb)[0].item()
         if iou >= 0.25:
             iou_25_tp += 1
         if iou >= 0.5:

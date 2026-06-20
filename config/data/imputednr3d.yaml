@@ -15,7 +15,7 @@ lang_metadata:
 chunk_size: 1
 
 evaluator:
-  _target_: m3drefclip.evaluation.referit3d_evaluator.ReferIt3DEvaluator
+  _target_: ges3vig.evaluation.referit3d_evaluator.ReferIt3DEvaluator
   verbose: False
   metric_name: accuracy
 
