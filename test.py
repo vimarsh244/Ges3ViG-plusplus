@@ -10,14 +10,17 @@ from ges3vig.data.data_module import DataModule
 torch.serialization.add_safe_globals([DictConfig, ListConfig])
 
 
-@hydra.main(version_base=None, config_path="config", config_name="global_config")
+@hydra.main(version_base=None, config_path="config", config_name="global_imputed_config")
 def main(cfg):
     # Seed control: by default use the fixed `test_seed` for reproducible IoU.
     # To run with a non-deterministic (random) seed, pass `test_seed=null`,
     # `test_seed=-1`, or `test_seed=random` on the command line.
     seed = cfg.test_seed
     if seed in (None, -1, "random", "rand"):
-        seed = pl.seed_everything(workers=True)  # picks a random seed and returns it
+        # pl.seed_everything() with no arg just defaults to 0 - draw a real random seed.
+        import random as _random
+        seed = _random.SystemRandom().randint(0, 2 ** 31 - 1)
+        pl.seed_everything(seed, workers=True)
         print(f"[test] Using RANDOM seed: {seed}")
     else:
         pl.seed_everything(int(seed), workers=True)

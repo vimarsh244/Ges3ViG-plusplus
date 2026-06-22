@@ -202,13 +202,29 @@ class OldGeneralMultiImputedDataset(Dataset):
             human_joints = self.human_data[human_name][f"l_h_{int(arm_angle.item())}"][f"joints_{lr}"]
 
             human_center_translate = torch.eye(4, dtype=torch.float64)
-            
-            human_center_translate[:3,3] = -torch.tensor(human_joints['left_shoulder'])
-            #print('left_shoulder: ', human_joints['left_shoulder'])
 
-            # target_shoulder = 'left_shoulder' if lr == 'left' else 'right_shoulder'
-            # human_center_translate[:3,3] = -torch.tensor(human_joints[target_shoulder])
-            #print(f'{target_shoulder}: ', human_joints[target_shoulder])
+            # --- Shoulder-rotation perturbation pivot ---------------------------
+            # BUG (previous behaviour): the pivot was hard-coded to
+            #     human_center_translate[:3,3] = -human_joints['left_shoulder']
+            # regardless of which arm is pointing. The joints are stored in a
+            # per-side dict: joints_left keeps the original keys ('left_shoulder',
+            # ...), while joints_right has every key renamed to its mirror
+            # (left_* -> right_*) when the human is reflected (see __init__,
+            # reflect_trans handling). So for a RIGHT-pointing human, the dict
+            # only carries 'right_shoulder', and 'left_shoulder' refers to the
+            # NON-pointing shoulder. The perturbation therefore rotated the human
+            # about the wrong (off-arm) shoulder for every right-handed sample.
+            #
+            # Why it didn't show up in the noise sweep: rotating about any
+            # vertical axis changes the pointing-ray azimuth by the same angle,
+            # so the wrong pivot only translates the human slightly and does not
+            # alter the perturbation magnitude -- the deg0/3/6 accuracy curve is
+            # flat for other reasons (tiny effective angle + detector dominance).
+            #
+            # FIX: select the pointing-side shoulder key based on `lr` so the
+            # rotation pivots about the correct shoulder for both arms.
+            target_shoulder = 'left_shoulder' if lr == 'left' else 'right_shoulder'
+            human_center_translate[:3,3] = -torch.tensor(human_joints[target_shoulder])
             human_perturbation_range = 0.5*self.data_cfg.human_perturbation_percentage*2*torch.pi/100
             human_perturbation = (torch.rand(1)-0.5)*human_perturbation_range
             perturb_transform = torch.eye(4, dtype=torch.float64)

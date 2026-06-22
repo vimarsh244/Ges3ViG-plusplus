@@ -26,7 +26,7 @@ test_seed: 123
 logger:
   # https://pytorch-lightning.readthedocs.io/en/stable/extensions/generated/pytorch_lightning.loggers.WandbLogger.html
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: M3DRef-CLIP
+  project: senselab-Ges3ViG
   name: ${experiment_name}
   save_dir: ${experiment_output_path}/training
 

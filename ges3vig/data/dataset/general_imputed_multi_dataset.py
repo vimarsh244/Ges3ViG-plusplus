@@ -178,7 +178,9 @@ class GeneralMultiImputedDataset(Dataset):
             instance_id = human_dict['instance_id']
             sem_label = human_dict['sem_label']
 
-            path=f"{self.data_cfg}/{human_name}/joints/{arm_angle}"
+            # arm_angle is a tensor; the joints subfolders are integer-named
+            # (e.g. ".../joints/90", not "90.0"), so cast before building the path.
+            path=f"{self.data_cfg.human_dir}/{human_name}/joints/{int(arm_angle.item())}"
             num_files = sum(1 for f in os.listdir(path) if os.path.isfile(os.path.join(path, f)))
             se=0
             if(num_files>1):
@@ -221,7 +223,18 @@ class GeneralMultiImputedDataset(Dataset):
 
             human_points = human_points[human_choices]
             human_rgb = 2*np.array(human_mesh.vertex_colors)-1
-            human_rgb = human_rgb[human_choices]
+            if human_rgb.shape[0] == human_points.shape[0]:
+                human_rgb = human_rgb[human_choices]
+            else:
+                # NOTE: the bent-elbow human assets (l_h_e_<angle>.ply) ship
+                # WITHOUT vertex colours (0 colours vs ~11437 verts), unlike the
+                # straight l_h_<angle>.ply meshes which are fully coloured. When
+                # the elbow variant is selected (se=1) there is no RGB to index,
+                # so fill neutral grey (0.5 in [0,1] -> 0 after the 2*c-1 mapping)
+                # to keep a valid RGB channel. This is a data gap in the
+                # imputerefer human set, not a geometry problem; revisit if the
+                # elbow meshes are ever re-exported with colours.
+                human_rgb = np.zeros((human_points.shape[0], 3), dtype=np.float64)
             human_normals = np.array(human_mesh.vertex_normals)[human_choices]
 
             human_instance_ids = np.array([instance_id]*len(human_points))[human_choices]
@@ -237,6 +250,9 @@ class GeneralMultiImputedDataset(Dataset):
             scene_data["aabb_obj_ids"] = np.concatenate([scene_data["aabb_obj_ids"],np.array([instance_id])])
             data_dict["human_lr_label"] = torch.tensor([0]) if lr=='left' else torch.tensor([1])
             data_dict["has_human"] = torch.tensor([True])
+            # expose the elbow angle (degrees) of the placed human so subclasses
+            # (e.g. ImputeRefer) can forward it to the angle/distance evaluators.
+            data_dict["arm_angle"] = int(arm_angle.item())
 
         # Optional robustness corruption (noise / partial capture). No-op unless
         # data.eval_corruption.enabled is set; GT boxes are never touched.

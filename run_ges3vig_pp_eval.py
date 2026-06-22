@@ -16,9 +16,9 @@ Experiments
                              config, for BOTH noelbowimputerefer AND imputerefer.
   5. realhumans            : ImputeReferRealHumans val (imputed real-human avatars).
   6. nohuman               : NoHumanImputeRefer val (no-human sensitivity analysis).
-  7. pc_noise_sweep        : Q7 - additive Gaussian noise over the WHOLE point cloud,
+  7. pc_noise_sweep        : additive Gaussian noise over the WHOLE point cloud,
                              sweeping sigma, for noelbow/imputerefer/nohuman _noise configs.
-  8. partial_sweep         : Q8 - partial / incomplete capture (frustum fov sweep +
+  8. partial_sweep         : partial / incomplete capture (frustum fov sweep +
                              random dropout keep-ratio sweep) for the same configs.
 
 Each run's full stdout is saved to  output/ges3vig-pp/<expt>.log  and a combined
@@ -48,6 +48,21 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "output", "ges3vig-pp")
 DEFAULT_CKPT = "/nas_hcfc/HRI_general/common/checkpoints/Ges3ViG_ImputeRefer.ckpt"
 
+# Proxemic-zone (distance) evaluator. When --distance is passed we swap the data
+# evaluator for this one; it prints the normal unique/multiple/overall IoU table
+# AND an extra per-zone (intimate/personal/social/public) table that we parse.
+# Zones = Hall's proxemics in metres: intimate<0.46, personal<1.22, social<3.70,
+# public>=3.70 (human shoulder-centre -> target object centre).
+DIST_EVAL_TARGET = "ges3vig.evaluation.scanrefer_distance_evaluator.ScanReferDistanceEvaluator"
+DIST_ZONES = ["intimate", "personal", "social", "public"]
+
+# Combined evaluator: standard + proxemic-distance + elbow-angle, and it dumps a
+# per-query JSON (one row per sample: distance, arm_angle, eval_type, raw IoU) to
+# output/ges3vig-pp/perquery/<run>.json so any graph/analysis can be redone offline.
+FULL_EVAL_TARGET = "ges3vig.evaluation.scanrefer_full_evaluator.ScanReferFullEvaluator"
+PERQUERY_DIR = os.path.join(RESULTS_DIR, "perquery")
+ANGLE_BINS = ["20-50°", "50-80°", "80-110°", "110-150°"]
+
 # All experiment keys (for --only validation / help)
 ALL_EXPERIMENTS = [
     "noelbow_random",
@@ -72,6 +87,16 @@ def run_test(name, overrides, args, log_path):
         f"experiment_name=ges3vigpp_{name}",
         f"trainer.limit_test_batches={args.limit_test_batches}",
     ] + overrides
+
+    # Optionally swap in a breakdown evaluator (keeps verbose + metric_name from
+    # the data config; only the _target_ class changes). --full also dumps a
+    # per-query JSON next to the logs.
+    if getattr(args, "full", False):
+        os.makedirs(PERQUERY_DIR, exist_ok=True)
+        cmd.append(f"data.evaluator._target_={FULL_EVAL_TARGET}")
+        cmd.append(f"+data.evaluator.results_save_path={os.path.join(PERQUERY_DIR, name + '.json')}")
+    elif getattr(args, "distance", False):
+        cmd.append(f"data.evaluator._target_={DIST_EVAL_TARGET}")
 
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -145,6 +170,78 @@ def fmt_iou(iou):
     return line("0.25", iou["iou25"]) + "\n" + line("0.50", iou["iou50"])
 
 
+def parse_distance(text):
+    """Parse the per-zone table printed by ScanReferDistanceEvaluator:
+
+        distance    count     IoU@0.25      IoU@0.50
+        intimate    0         nan           nan
+        personal    123       45.6          30.1
+        ...
+
+    Returns {zone: {"count": int, "iou25": float|nan, "iou50": float|nan}} or
+    None if the table is absent (e.g. the run used the plain evaluator)."""
+    out = {}
+    for zone in DIST_ZONES:
+        m = re.search(rf"^{zone}\s+([0-9]+)\s+{_NUM}\s+{_NUM}", text, re.MULTILINE)
+        if not m:
+            continue
+        def f(x):
+            return float("nan") if x == "nan" else float(x)
+        out[zone] = {"count": int(m.group(1)), "iou25": f(m.group(2)), "iou50": f(m.group(3))}
+    return out or None
+
+
+def parse_angle(text):
+    """Parse the elbow-angle table printed by ScanReferFullEvaluator.
+    Returns {bin: {"count","iou25","iou50"}} or None."""
+    out = {}
+    for b in ANGLE_BINS:
+        m = re.search(rf"^{re.escape(b)}\s+([0-9]+)\s+{_NUM}\s+{_NUM}", text, re.MULTILINE)
+        if not m:
+            continue
+        def f(x):
+            return float("nan") if x == "nan" else float(x)
+        out[b] = {"count": int(m.group(1)), "iou25": f(m.group(2)), "iou50": f(m.group(3))}
+    return out or None
+
+
+def _dist(text, args):
+    """Spread-helper: attach distance (and angle, under --full) breakdowns to a
+    summary entry. Returns {} when no breakdown flag is set."""
+    out = {}
+    if getattr(args, "full", False) or getattr(args, "distance", False):
+        d = parse_distance(text)
+        if d:
+            out["distance"] = d
+    if getattr(args, "full", False):
+        a = parse_angle(text)
+        if a:
+            out["angle"] = a
+    return out
+
+
+def _fmt_breakdown(table, order, header):
+    if not table:
+        return None
+    lines = [f"    {header} (count | IoU@0.25 | IoU@0.50):"]
+    for k in order:
+        d = table.get(k)
+        if d is None:
+            continue
+        i25 = "  nan" if d["iou25"] != d["iou25"] else f"{d['iou25']:5.1f}"
+        i50 = "  nan" if d["iou50"] != d["iou50"] else f"{d['iou50']:5.1f}"
+        lines.append(f"      {k:<10} n={d['count']:<6} {i25}   {i50}")
+    return "\n".join(lines)
+
+
+def fmt_distance(dist):
+    return _fmt_breakdown(dist, DIST_ZONES, "by proxemic zone")
+
+
+def fmt_angle(angle):
+    return _fmt_breakdown(angle, ANGLE_BINS, "by elbow angle")
+
+
 def mean_std(values):
     vals = [v for v in values if v is not None and not (isinstance(v, float) and v != v)]
     if not vals:
@@ -164,7 +261,8 @@ def expt_noelbow_random(args, summary):
         ["data=noelbowimputerefer", "data.inference.split=val", "test_seed=random"],
         args, os.path.join(RESULTS_DIR, f"{name}.log"),
     )
-    summary[name] = {"iou": parse_iou(text), "note": "NoElbowImputeRefer val, random seed"}
+    summary[name] = {"iou": parse_iou(text), "note": "NoElbowImputeRefer val, random seed",
+                     **_dist(text, args)}
 
 
 def expt_noelbow_5seeds(args, summary):
@@ -178,7 +276,7 @@ def expt_noelbow_5seeds(args, summary):
             args, os.path.join(RESULTS_DIR, f"{name}.log"),
         )
         iou = parse_iou(text)
-        per_seed[seed] = iou
+        per_seed[seed] = {"iou": iou, **_dist(text, args)} if getattr(args, "distance", False) else iou
         if iou and iou["iou25"]:
             o25.append(iou["iou25"]["overall"]); u25.append(iou["iou25"]["unique"]); m25.append(iou["iou25"]["multiple"])
         if iou and iou["iou50"]:
@@ -204,12 +302,22 @@ def expt_imputerefer(args, summary):
         args, os.path.join(RESULTS_DIR, f"{name}.log"),
     )
     summary[name] = {"iou": parse_iou(text),
-                     "note": "ImputeRefer (bent-elbow, extra samples) val, SAME checkpoint, no retraining"}
+                     "note": "ImputeRefer (bent-elbow, extra samples) val, SAME checkpoint, no retraining",
+                     **_dist(text, args)}
+
+
+def _select_datasets(args, datasets):
+    """Filter a sweep's dataset tuple by --datasets (exact match). None => keep all."""
+    if not args.datasets:
+        return list(datasets)
+    return [d for d in datasets if d in args.datasets]
 
 
 def expt_noise_sweep(args, summary):
-    out = {}
-    for dataset in ("noelbowimputerefer", "imputerefer"):
+    entry = summary.setdefault("noise_sweep",
+                               {"runs": {}, "note": "Shoulder-rotation noise sweep (straight-arm) for noelbow + imputerefer"})
+    out = entry["runs"]
+    for dataset in _select_datasets(args, ("noelbowimputerefer", "imputerefer")):
         for deg in args.degrees:
             perc = round(deg / 1.8, 4)  # config percentage; DEG = perc * 1.8
             name = f"noise_{dataset}_deg{deg}"
@@ -221,9 +329,8 @@ def expt_noise_sweep(args, summary):
                 args, os.path.join(RESULTS_DIR, f"{name}.log"),
             )
             out[name] = {"dataset": dataset, "degrees": deg,
-                         "human_perturbation_percentage": perc, "iou": parse_iou(text)}
-    summary["noise_sweep"] = {"runs": out,
-                              "note": "Shoulder-rotation noise sweep (straight-arm) for noelbow + imputerefer"}
+                         "human_perturbation_percentage": perc, "iou": parse_iou(text),
+                         **_dist(text, args)}
 
 
 def expt_realhumans(args, summary):
@@ -233,7 +340,8 @@ def expt_realhumans(args, summary):
         ["data=imputerefer_realhumans", "data.inference.split=val", f"test_seed={args.seeds[0]}"],
         args, os.path.join(RESULTS_DIR, f"{name}.log"),
     )
-    summary[name] = {"iou": parse_iou(text), "note": "ImputeReferRealHumans val (imputed real-human avatars)"}
+    summary[name] = {"iou": parse_iou(text), "note": "ImputeReferRealHumans val (imputed real-human avatars)",
+                     **_dist(text, args)}
 
 
 def expt_nohuman(args, summary):
@@ -243,13 +351,16 @@ def expt_nohuman(args, summary):
         ["data=nohumanimputerefer", "data.inference.split=val", f"test_seed={args.seeds[0]}"],
         args, os.path.join(RESULTS_DIR, f"{name}.log"),
     )
-    summary[name] = {"iou": parse_iou(text), "note": "NoHumanImputeRefer val (no-human sensitivity)"}
+    summary[name] = {"iou": parse_iou(text), "note": "NoHumanImputeRefer val (no-human sensitivity)",
+                     **_dist(text, args)}
 
 
 def expt_pc_noise_sweep(args, summary):
     """Q7: additive Gaussian noise over the ENTIRE point cloud, sweeping sigma (meters)."""
-    out = {}
-    for dataset in ("noelbowimputerefer_noise", "imputerefer_noise", "nohumanimputerefer_noise"):
+    entry = summary.setdefault("pc_noise_sweep",
+                               {"runs": {}, "note": "Q7: whole-cloud Gaussian noise sweep (sigma in meters)"})
+    out = entry["runs"]
+    for dataset in _select_datasets(args, ("noelbowimputerefer_noise", "imputerefer_noise", "nohumanimputerefer_noise")):
         for sigma in args.noise_sigmas:
             name = f"pcnoise_{dataset}_sigma{sigma}"
             text, _ = run_test(
@@ -261,15 +372,16 @@ def expt_pc_noise_sweep(args, summary):
                  "data.eval_corruption.partial.enabled=false"],
                 args, os.path.join(RESULTS_DIR, f"{name}.log"),
             )
-            out[name] = {"dataset": dataset, "noise_sigma": sigma, "iou": parse_iou(text)}
-    summary["pc_noise_sweep"] = {"runs": out,
-                                 "note": "Q7: whole-cloud Gaussian noise sweep (sigma in meters)"}
+            out[name] = {"dataset": dataset, "noise_sigma": sigma, "iou": parse_iou(text),
+                         **_dist(text, args)}
 
 
 def expt_partial_sweep(args, summary):
     """Q8: partial / incomplete capture. frustum (fov sweep) + dropout (keep_ratio sweep)."""
-    out = {}
-    for dataset in ("noelbowimputerefer_noise", "imputerefer_noise", "nohumanimputerefer_noise"):
+    entry = summary.setdefault("partial_sweep",
+                               {"runs": {}, "note": "Q8: partial capture - frustum (fov) + dropout (keep_ratio)"})
+    out = entry["runs"]
+    for dataset in _select_datasets(args, ("noelbowimputerefer_noise", "imputerefer_noise", "nohumanimputerefer_noise")):
         # frustum capture: only points inside a random camera view survive
         for fov in args.frustum_fovs:
             name = f"partial_{dataset}_frustum_fov{fov}"
@@ -283,7 +395,8 @@ def expt_partial_sweep(args, summary):
                  f"data.eval_corruption.partial.fov_deg={fov}"],
                 args, os.path.join(RESULTS_DIR, f"{name}.log"),
             )
-            out[name] = {"dataset": dataset, "mode": "frustum", "fov_deg": fov, "iou": parse_iou(text)}
+            out[name] = {"dataset": dataset, "mode": "frustum", "fov_deg": fov, "iou": parse_iou(text),
+                         **_dist(text, args)}
         # random dropout: fraction of points kept
         for keep in args.keep_ratios:
             name = f"partial_{dataset}_dropout_keep{keep}"
@@ -297,9 +410,8 @@ def expt_partial_sweep(args, summary):
                  f"data.eval_corruption.partial.keep_ratio={keep}"],
                 args, os.path.join(RESULTS_DIR, f"{name}.log"),
             )
-            out[name] = {"dataset": dataset, "mode": "dropout", "keep_ratio": keep, "iou": parse_iou(text)}
-    summary["partial_sweep"] = {"runs": out,
-                                "note": "Q8: partial capture - frustum (fov) + dropout (keep_ratio)"}
+            out[name] = {"dataset": dataset, "mode": "dropout", "keep_ratio": keep, "iou": parse_iou(text),
+                         **_dist(text, args)}
 
 
 EXPERIMENT_FUNCS = {
@@ -338,6 +450,13 @@ def write_summary(summary, args):
         lines.append("")
         lines.append(f"### {key}  -  {entry.get('note', '')}")
 
+        # helper: append distance + angle breakdown tables if the entry carries them
+        def _emit_dist(entry_or_run):
+            for block in (fmt_distance(entry_or_run.get("distance")),
+                          fmt_angle(entry_or_run.get("angle"))):
+                if block:
+                    lines.append(block)
+
         if key == "noelbow_5seeds":
             agg = entry["aggregate_mean_std"]
             lines.append(f"    seeds: {entry['seeds']}")
@@ -351,18 +470,22 @@ def write_summary(summary, args):
                 lines.append(f"  [{r['dataset']}  {r['degrees']} deg "
                              f"(perc={r['human_perturbation_percentage']})]")
                 lines.append(fmt_iou(r["iou"]))
+                _emit_dist(r)
         elif key == "pc_noise_sweep":
             for rname, r in entry["runs"].items():
                 lines.append(f"  [{r['dataset']}  sigma={r['noise_sigma']} m]")
                 lines.append(fmt_iou(r["iou"]))
+                _emit_dist(r)
         elif key == "partial_sweep":
             for rname, r in entry["runs"].items():
                 detail = (f"fov={r['fov_deg']}" if r["mode"] == "frustum"
                           else f"keep_ratio={r['keep_ratio']}")
                 lines.append(f"  [{r['dataset']}  {r['mode']}  {detail}]")
                 lines.append(fmt_iou(r["iou"]))
+                _emit_dist(r)
         else:
             lines.append(fmt_iou(entry.get("iou")))
+            _emit_dist(entry)
 
     lines.append("")
     lines.append("=" * 78)
@@ -375,13 +498,14 @@ def write_summary(summary, args):
 
 # --------------------------------------------------------------------------- #
 def main():
+    global RESULTS_DIR, PERQUERY_DIR
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", default=DEFAULT_CKPT, help="Checkpoint to evaluate")
     p.add_argument("--gpu", default="1", help="CUDA_VISIBLE_DEVICES id (default 1)")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4],
                    help="Fixed seeds for the 5-seed run (also seeds[0] for single-seed expts)")
-    p.add_argument("--degrees", type=int, nargs="+", default=[0, 3, 6, 9],
+    p.add_argument("--degrees", type=int, nargs="+", default=[0, 3, 6, 9, 12, 18, 24, 30, 36],
                    help="Shoulder-rotation noise degrees to sweep (default 0,3,6,9)")
     p.add_argument("--noise-sigmas", dest="noise_sigmas", type=float, nargs="+",
                    default=[0.0, 0.01, 0.02, 0.05, 0.1],
@@ -396,9 +520,32 @@ def main():
                    help="Pass-through to trainer.limit_test_batches (1.0=full, int=#batches)")
     p.add_argument("--quick", action="store_true",
                    help="Smoke mode: limit_test_batches=25 (fast subset validation)")
+    p.add_argument("--distance", action="store_true",
+                   help="Use the proxemic-zone distance evaluator: also report IoU broken "
+                        "down by human<->target distance zone (intimate/personal/social/public). "
+                        "Composes with any --only/--datasets selection.")
+    p.add_argument("--full", action="store_true",
+                   help="Use the combined evaluator: standard + proxemic-distance + elbow-angle "
+                        "breakdowns in one log, plus a per-query JSON dump under "
+                        "output/ges3vig-pp/perquery/<run>.json for offline analysis. "
+                        "Overrides --distance.")
     p.add_argument("--only", nargs="+", choices=ALL_EXPERIMENTS, default=ALL_EXPERIMENTS,
                    help="Subset of experiments to run")
+    p.add_argument("--datasets", nargs="+", default=None,
+                   help="Restrict the sweep experiments (noise_sweep/pc_noise_sweep/partial_sweep) "
+                        "to these exact dataset names, e.g. 'imputerefer imputerefer_noise'. "
+                        "Default: all datasets in each sweep.")
+    p.add_argument("--fresh", action="store_true",
+                   help="Start SUMMARY from scratch. Default: merge into the existing SUMMARY.json "
+                        "so reruns only overwrite the experiments/runs you actually re-ran.")
+    p.add_argument("--results-dir", dest="results_dir", default=RESULTS_DIR,
+                   help="Output directory for logs/SUMMARY/perquery (default output/ges3vig-pp). "
+                        "Use e.g. output/ges3vig-pp_v2 to keep a run separate.")
     args = p.parse_args()
+
+    # Redirect all outputs (logs, SUMMARY, per-query JSON) to the chosen dir.
+    RESULTS_DIR = os.path.abspath(args.results_dir)
+    PERQUERY_DIR = os.path.join(RESULTS_DIR, "perquery")
 
     if args.quick:
         args.limit_test_batches = "25"
@@ -411,8 +558,19 @@ def main():
     print(f"Results -> {RESULTS_DIR}")
     print(f"Experiments: {args.only}")
 
-    summary = {"_meta": {"ckpt": args.ckpt, "seeds": args.seeds, "degrees": args.degrees,
-                         "limit_test_batches": args.limit_test_batches}}
+    # merge into the existing SUMMARY.json by default so a partial rerun (e.g. only the
+    # imputerefer datasets) doesn't wipe out previously-successful experiments/runs.
+    summary = {}
+    existing_json = os.path.join(RESULTS_DIR, "SUMMARY.json")
+    if not args.fresh and os.path.exists(existing_json):
+        with open(existing_json) as f:
+            summary = json.load(f)
+        print(f"Merging into existing summary: {existing_json}")
+    summary["_meta"] = {"ckpt": args.ckpt, "seeds": args.seeds, "degrees": args.degrees,
+                        "limit_test_batches": args.limit_test_batches}
+    if args.datasets:
+        print(f"Sweep datasets restricted to: {args.datasets}")
+
     for key in ALL_EXPERIMENTS:
         if key in args.only:
             EXPERIMENT_FUNCS[key](args, summary)
