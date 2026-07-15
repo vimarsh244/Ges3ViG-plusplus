@@ -154,6 +154,7 @@ def _collate_fn(batch):
     has_human = []
     human_joint_matrix = []
     joint_name_idx_map = []
+    human_joint_mask = []
     for i, b in enumerate(batch):
         batch_points_start_idx = data_dict["point_count_offsets"][i]
         batch_points_end_idx = data_dict["point_count_offsets"][i+1]
@@ -195,8 +196,13 @@ def _collate_fn(batch):
         has_human.append(b["has_human"])
         human_joint_matrix.append(torch.from_numpy(b['human_joint_matrix']))
         joint_name_idx_map.append(b['joint_name_idx_map'])
+        if "human_joint_mask" in b:
+            human_joint_mask.append(torch.from_numpy(b['human_joint_mask']))
     data_dict['joint_name_idx_map'] = joint_name_idx_map
     data_dict["human_joint_matrix"] = torch.cat(human_joint_matrix)
+    # Only present for datasets that provide partial GT joints (e.g. real humans).
+    if human_joint_mask:
+        data_dict["human_joint_mask"] = torch.cat(human_joint_mask)
     data_dict["human_lr_label"] = torch.cat(human_lr_label)
     data_dict["has_human"] = torch.cat(has_human)
     data_dict["instance_num_point"] = torch.cat(instance_num_point, dim=0)

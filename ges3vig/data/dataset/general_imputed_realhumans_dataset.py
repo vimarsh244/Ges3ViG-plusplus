@@ -36,6 +36,47 @@ SYNTHETIC_TYPES = [
     "woman_tall_white",
 ]
 
+# Canonical SMPL-X 55-joint order. This is exactly the order the synthetic
+# humans store their joints in, and therefore the order the JointRegressor
+# (num_joints=55) was trained to output. Real-human assets only provide the 10
+# arm joints; we must place them at their canonical indices so that
+#   - the human-joint loss lines up with the 55-wide regressor output, and
+#   - joint_name_idx_map[...] indexes the right joint in output_dict["joints"]
+#     for the pointing-bias / distance code (e.g. left_shoulder -> 16).
+SMPLX_JOINT_ORDER = [
+    "pelvis", "left_hip", "right_hip", "spine1", "left_knee", "right_knee",
+    "spine2", "left_ankle", "right_ankle", "spine3", "left_foot", "right_foot",
+    "neck", "left_collar", "right_collar", "head", "left_shoulder",
+    "right_shoulder", "left_elbow", "right_elbow", "left_wrist", "right_wrist",
+    "jaw", "left_eye_smplhf", "right_eye_smplhf", "left_index1", "left_index2",
+    "left_index3", "left_middle1", "left_middle2", "left_middle3", "left_pinky1",
+    "left_pinky2", "left_pinky3", "left_ring1", "left_ring2", "left_ring3",
+    "left_thumb1", "left_thumb2", "left_thumb3", "right_index1", "right_index2",
+    "right_index3", "right_middle1", "right_middle2", "right_middle3",
+    "right_pinky1", "right_pinky2", "right_pinky3", "right_ring1", "right_ring2",
+    "right_ring3", "right_thumb1", "right_thumb2", "right_thumb3",
+]
+SMPLX_JOINT_INDEX = {name: idx for idx, name in enumerate(SMPLX_JOINT_ORDER)}
+NUM_SMPLX_JOINTS = len(SMPLX_JOINT_ORDER)  # 55
+
+
+def _build_canonical_joint_layout(joints_by_name):
+    """Lay real-human arm joints into the canonical 55-joint SMPL-X frame.
+
+    Returns (joint_matrix[1,55,3], joint_name_idx_map{name->canonical idx},
+    joint_mask[1,55]) where the mask is 1 only on joints we actually have, so
+    the joint-regression loss ignores the 45 unobserved joints (zeros).
+    """
+    joint_matrix = np.zeros((1, NUM_SMPLX_JOINTS, 3), dtype=np.float64)
+    joint_mask = np.zeros((1, NUM_SMPLX_JOINTS), dtype=np.float32)
+    for name, coord in joints_by_name.items():
+        idx = SMPLX_JOINT_INDEX.get(name)
+        if idx is None:  # e.g. bare 'left_index'/'right_index' not in SMPL-X 55
+            continue
+        joint_matrix[0, idx] = np.asarray(coord, dtype=np.float64)
+        joint_mask[0, idx] = 1.0
+    return joint_matrix, dict(SMPLX_JOINT_INDEX), joint_mask
+
 
 class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
     """
@@ -200,19 +241,10 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
         return nearest, chosen
 
     def _build_dummy_human(self):
-        joint_names = [
-            "left_shoulder",
-            "right_shoulder",
-            "left_elbow",
-            "right_elbow",
-            "left_wrist",
-            "right_wrist",
-            "left_index1",
-            "right_index1",
-        ]
-        joint_map = {name: idx for idx, name in enumerate(joint_names)}
-        joint_matrix = np.zeros((1, len(joint_names), 3), dtype=np.float64)
-        return joint_matrix, joint_map
+        # No human present: still emit a full canonical 55-joint frame (all
+        # zeros, fully masked out) so batches with and without humans collate
+        # together and the regressor output (55) always lines up.
+        return _build_canonical_joint_layout({})
 
     def __getitem__(self, index):
         data_dict = {}
@@ -411,17 +443,17 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
                     joint - scene_center_xyz
                 ) @ xyz_augment_matrix
 
-            final_joint_matrix = []
-            final_joint_name_idx_map = {}
-            for pidx, (name, joints) in enumerate(human_joints_final_augmented.items()):
-                final_joint_name_idx_map[name] = pidx
-                final_joint_matrix.append(joints)
-            data_dict["human_joint_matrix"] = np.stack([final_joint_matrix])
-            data_dict["joint_name_idx_map"] = final_joint_name_idx_map
-        else:
-            joint_matrix, joint_map = self._build_dummy_human()
+            joint_matrix, joint_map, joint_mask = _build_canonical_joint_layout(
+                human_joints_final_augmented
+            )
             data_dict["human_joint_matrix"] = joint_matrix
             data_dict["joint_name_idx_map"] = joint_map
+            data_dict["human_joint_mask"] = joint_mask
+        else:
+            joint_matrix, joint_map, joint_mask = self._build_dummy_human()
+            data_dict["human_joint_matrix"] = joint_matrix
+            data_dict["joint_name_idx_map"] = joint_map
+            data_dict["human_joint_mask"] = joint_mask
 
         point_normal = (
             scene_data["normal"][choices]

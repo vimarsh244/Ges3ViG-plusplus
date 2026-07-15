@@ -19,10 +19,14 @@ import torch
 from tqdm import tqdm
 
 from ges3vig.util.utils import get_batch_aabb_pair_ious
-from ges3vig.evaluation.scanrefer_evaluator import ScanReferEvaluator
+from ges3vig.evaluation.noise_injection_evaluator import NoiseInjectionEvaluator
 
 
-class ScanReferFullEvaluator(ScanReferEvaluator):
+class ScanReferFullEvaluator(NoiseInjectionEvaluator):
+    # Inherits from NoiseInjectionEvaluator (not ScanReferEvaluator) so that the
+    # `corruption_cfg` kwarg injected by the *_noise.yaml data configs is absorbed
+    # and the corruption settings are reported. `corruption_cfg` defaults to None,
+    # so this is also a no-op for non-noise configs.
     def __init__(self, *args,
                  distance_bins=None, distance_labels=None,
                  angle_bins=None, angle_labels=None,
@@ -153,6 +157,7 @@ class ScanReferFullEvaluator(ScanReferEvaluator):
             }
 
         if self.verbose:
+            self._print_corruption()
             self._print_results(iou_25_results, iou_50_results)
             self._print_breakdown(
                 "  Proxemic-distance breakdown (human -> target, metres)",
