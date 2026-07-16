@@ -9,7 +9,9 @@ for a batch.
 ## The two default commands
 
 ```bash
-PY=/nas_hcfc/vimarsh/HRI/miniconda3/envs/ges3vig-gpu/bin/python   # local dev box
+# local dev box. NOTE: this must be the /home/vim conda, not the NAS one -
+# see "Use the right env" below.
+PY=/home/vim/miniconda3/envs/ges3vig-gpu/bin/python
 ```
 
 **1. Full sweep - runs every case and stores one CSV.** This is the one to run.
@@ -70,7 +72,7 @@ Runs these cases back-to-back (pick a subset with `--cases`):
 | case | what it varies | default |
 |---|---|---|
 | `points` | point count | **10k→90k in 10k steps** (`--point-sweep`) |
-| `dropout` | random point drop (keep-ratio) | `1.0 0.75 0.5 0.25 0.1` (`--dropout-sweep`) |
+| `dropout` | random point drop (keep-ratio) | `1.0 0.75 0.5` (`--dropout-sweep`) |
 | `foveation` | #proposals reaching the 2D encoder + fusion | `80 48 32 16 8 4 1` (`--foveation-sweep`) |
 | `batch` | batch size | `1 2 4` (`--batch-sweep`) |
 
@@ -138,11 +140,13 @@ scene differ, and the detector's cost depends on them.)
 | `--cases` | which sweep cases to run (`points dropout foveation batch`) |
 | `--cpu` | force CPU |
 | `--fp16` | autocast fp16 (auto-disabled when MinkowskiEngine is present) |
-| `--skip-2d` | disable the 2D branch - **see the pytorch3d note below** |
+| `--stub-renderer` | fake the rasterizer, keep `clip_image` real - **auto-enabled when pytorch3d lacks CUDA; see below** |
+| `--skip-2d` | drop the 2D branch entirely (blunt; prefer `--stub-renderer`) |
+| `--no-auto-stub` | don't auto-stub; let the renderer fail loudly |
 
 ## Reading the output
 
-Every table has `mean std min p50 p95 max fps`.
+Every table has `mean std min p50 p90 p95 max fps`.
 
 * **`fps`** = scenes/second = `1 / (per-scene time)` = `batch_size / mean_seconds`.
   For a batched row it is per-scene throughput, not the pass rate.
@@ -172,16 +176,25 @@ needs a CUDA pytorch3d. A **CPU-only pytorch3d** raises
 `RuntimeError: Not compiled with GPU support` at `rasterize_points` and takes the
 whole pipeline down with it - including `clip_image`, the most expensive module.
 
-The `ges3vig-gpu` conda env on the x86 dev box has exactly this problem: its
-pytorch3d 0.7.8 has no CUDA symbols and isn't linked against libcudart.
+> **Use the right env.** There are two conda envs named `ges3vig-gpu` on this box
+> and only one of them works:
+>
+> | env | pytorch3d | use it? |
+> |---|---|---|
+> | `/home/vim/miniconda3/envs/ges3vig-gpu` | CUDA - **works** | **yes** - this is what `conda activate ges3vig-gpu` gives you, and what the eval suite uses |
+> | `/nas_hcfc/vimarsh/HRI/miniconda3/envs/ges3vig-gpu` | CPU-only - broken | no (stale duplicate) |
+>
+> Same name, same version (0.7.8), different builds. If the renderer explodes,
+> check which python you actually invoked.
 
-So the profiler **auto-enables `--stub-renderer`** there: rasterization is
-replaced by random images of the same shape, and `clip_image` + fusion still run
-for real. The reported total then **excludes rasterization cost** (it's called
-out in the output). Nothing else changes - the model keeps its real architecture.
+If you are stuck on a host with a CPU-only pytorch3d, the profiler
+**auto-enables `--stub-renderer`**: rasterization is replaced by random images of
+the same shape, and `clip_image` + fusion still run for real. The reported total
+then **excludes rasterization cost** - which is ~21% of the forward, so treat
+those totals as a lower bound. It is a fallback, not the way to measure.
 
 ```bash
-# just works; the stub is applied automatically with a warning
+# on a good env this runs the real renderer; on a broken one it stubs + warns
 $PY profiling/profile_jetson.py --mode full
 ```
 
@@ -191,23 +204,28 @@ changes `match_module`'s input dims and skips the foveation case. Prefer the stu
 The **Jetson image builds pytorch3d from source with `FORCE_CUDA=1`**, so on the
 Jetson the renderer runs for real and no stub is applied.
 
-## Reference numbers (x86 RTX 4000 Ada, random weights, renderer stubbed)
+## Reference numbers (x86 RTX 4000 Ada, random weights, real renderer)
 
 Not Jetson numbers - a baseline to sanity-check the Jetson run against. The Orin
-Nano will be substantially slower. All from the default sweep command above.
+Nano will be substantially slower. All from the default sweep command above, run
+on `/home/vim/miniconda3/envs/ges3vig-gpu` (CUDA pytorch3d, nothing stubbed).
 
 ### Where the time goes (`--mode full`, 20k pts, bs=1)
 
 | stage | p50 (ms) | share |
 |---|---|---|
-| **`clip_image` (2D vision encoder)** | **111.1** | **66%** |
-| `detector` (PointGroup + Minkowski + clustering) | 51.9 | 31% |
+| **`clip_image` (2D vision encoder)** | **109.4** | **51%** |
+| `detector` (PointGroup + Minkowski + clustering) | 50.9 | 24% |
+| **`object_renderer` (pytorch3d rasterize)** | **44.4** | **21%** |
 | `text_encoder` | 2.4 | |
 | `match_module` (fusion) | 1.0 | |
 | `human_processor` | 0.6 | |
 | `joint_module` | 0.3 | |
 | non-module ops (bias/dense-convert/einsum) | 1.1 | |
-| **TOTAL** | **~168.6** | **5.9 fps** |
+| **TOTAL** | **~211.7** | **4.70 fps** |
+
+**The 2D branch (`object_renderer` + `clip_image`) is ~72% of the forward.**
+Inside the renderer, `rasterizer` is ~30ms and `compositor` ~5ms.
 
 ### Point-count scan (`points`)
 
@@ -215,26 +233,26 @@ The detector is ~linear in points; the total tracks it.
 
 | points | total ms | fps | detector ms |
 |---|---|---|---|
-| 10k | 137.2 | 7.29 | 41.1 |
-| 30k | 175.9 | 5.69 | 62.3 |
-| 50k | 210.2 | 4.76 | 95.7 |
-| 70k | 259.1 | 3.86 | 147.3 |
-| 90k | 302.8 | 3.30 | 187.6 |
+| 10k | 150.1 | 6.66 | 41.3 |
+| 30k | 235.6 | 4.24 | 61.7 |
+| 50k | 289.1 | 3.46 | 88.7 |
+| 70k | 366.4 | 2.73 | 126.9 |
+| 90k | 449.7 | 2.22 | 182.1 |
 
 ### Foveation cost curve (`foveation`) - 2D encoder + fusion only
 
-Dead linear in proposals. This is the headline: the 2D branch alone costs more
-than the entire rest of the network at the default 80 proposals.
+Dead linear in proposals. At the default 80 proposals the 2D branch alone costs
+more than the entire rest of the network.
 
 | proposals | 2D+fusion ms | fps |
 |---|---|---|
-| 80 | 258.1 | 3.88 |
-| 48 | 156.0 | 6.41 |
-| 32 | 98.9 | 10.11 |
-| 16 | 50.7 | 19.74 |
-| 8 | 25.2 | 39.72 |
-| 4 | 13.5 | 73.91 |
-| 1 | 4.9 | - |
+| 80 | 258.7 | 3.87 |
+| 48 | 156.1 | 6.40 |
+| 32 | 99.8 | 10.02 |
+| 16 | 50.5 | 19.81 |
+| 8 | 25.3 | 39.49 |
+| 4 | 13.6 | 73.72 |
+| 1 | 5.0 | 200.40 |
 
 ### Batch scan (`batch`) - per-scene throughput
 
@@ -242,29 +260,31 @@ Batching helps a little; it does not change the picture.
 
 | batch | total ms | ms/scene | fps |
 |---|---|---|---|
-| 1 | 177.7 | 177.7 | 5.63 |
-| 2 | 332.9 | 166.5 | 6.01 |
-| 4 | 619.3 | 154.8 | 6.46 |
+| 1 | 251.6 | 251.6 | 3.97 |
+| 2 | 477.6 | 238.8 | 4.19 |
+| 4 | 892.7 | 223.2 | 4.48 |
 
 ### Dropout scan (`dropout`, 40k base)
 
 | keep | total ms | fps | detector ms |
 |---|---|---|---|
-| 1.0 | 179.7 | 5.56 | 72.9 |
-| 0.75 | 188.5 | 5.30 | 63.5 |
-| 0.5 | 165.2 | 6.05 | 52.4 |
+| 1.0 | 253.0 | 3.95 | 72.2 |
+| 0.75 | 251.1 | 3.98 | 64.0 |
+| 0.5 | 208.6 | 4.79 | 54.4 |
 
-Note the **detector falls monotonically** (72.9 → 63.5 → 52.4) but the **total
-does not** - because dropping points also changes how many proposals the
-clustering emits, and `clip_image` cost is driven by proposal count, not point
-count. Dropout is not a reliable lever on end-to-end latency; foveation is.
+The **detector falls cleanly** (72.2 -> 64.0 -> 54.4) but the **total barely
+moves at keep=0.75** - dropping points also changes how many proposals the
+clustering emits, and the 2D cost is driven by proposal count, not point count.
+Dropout is a weak lever on end-to-end latency; foveation is the strong one.
 
 ### What this says
 
-1. **The 2D CLIP image encoder is the bottleneck** - 66% of the forward, linear
-   in `proposals × 3 views` **per scene**. Attack this first.
-2. **The detector owns the rest** (~31%), almost all MinkowskiEngine sparse convs
-   in `score_net` / `backbone`, and it scales with point count.
+1. **The 2D branch is the bottleneck - ~72% of the forward** (`clip_image` 51% +
+   `object_renderer` 21%). It renders and encodes `proposals x 3 views` images
+   **per scene**. Attack this first.
+2. **The detector owns most of the rest** (~24%), almost all MinkowskiEngine
+   sparse convs in `score_net` / `backbone`, scaling with point count.
 3. **Everything else is noise** (<3% combined): text, fusion, gesture, human.
-4. Foveating to 16 proposals would cut the 2D branch ~5× (258 → 51ms), which is
-   worth far more than any point-cloud decimation.
+4. Foveating to 16 proposals cuts the 2D branch ~5x (259 -> 50ms) - worth far
+   more than any point-cloud decimation. `original_Ges3ViG` has no foveation; the
+   `Ges3ViG/` fork implements it as `foveated_2d`.

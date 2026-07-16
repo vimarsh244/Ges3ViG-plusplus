@@ -133,17 +133,17 @@ RUN pip3 install --no-cache-dir --no-build-isolation --no-deps .
 RUN cd ges3vig/common_ops && python3 setup.py install
 
 # ── build-time sanity check ──────────────────────────────────────────────────
-# Import-only (no GPU during build). Verifies every native extension links.
-RUN python3 -c "\
-import torch, MinkowskiEngine, clip, pytorch3d, hydra, lightning; \
-from pytorch3d import _C; \
-import COMMON_OPS; \
-print('torch      ', torch.__version__); \
-print('minkowski  ', MinkowskiEngine.__version__); \
-print('pytorch3d  ', pytorch3d.__version__); \
-print('pytorch3d CUDA-built:', hasattr(_C, 'points_to_volumes_forward') or True); \
-print('COMMON_OPS ok'); \
-print('ALL IMPORTS OK')"
+# No GPU is visible during the build, so we cannot *run* a CUDA kernel here.
+# Instead we assert the extensions LINK and that pytorch3d actually carries CUDA
+# rasterization symbols -- a CPU-only pytorch3d builds and imports perfectly
+# happily and only explodes at runtime with "Not compiled with GPU support",
+# which is precisely the failure this image exists to avoid. Fail the build now
+# rather than ship a broken 2D branch.
+# Kept in the image (not deleted): on the Jetson it re-runs with a real GPU and
+# additionally executes a live CUDA rasterize, so it doubles as a smoke test:
+#   docker run --rm --runtime nvidia <image> python3 verify_build.py
+COPY docker/verify_build.py ./verify_build.py
+RUN python3 verify_build.py
 
 # Default: print the profiler help (needs --runtime nvidia to actually profile)
 CMD ["python3", "profiling/profile_jetson.py", "--help"]

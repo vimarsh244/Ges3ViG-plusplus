@@ -30,14 +30,27 @@ if you invoke docker yourself:
 docker buildx build -f docker/Dockerfile.jetson --platform linux/arm64 -t ges3vig-jetson .
 ```
 
+## Smoke-test on the Jetson
+
+`verify_build.py` ships inside the image. It runs at build time (import + CUDA
+symbol checks) and, on real hardware, additionally executes a live CUDA
+rasterize - run it first on a new Jetson:
+
+```bash
+docker run --rm --runtime nvidia ges3vig-jetson:latest python3 verify_build.py
+# ... pytorch3d CUDA rasterization symbols: 10 (good)
+# ... live CUDA rasterize: OK
+# ... ALL IMPORTS OK
+```
+
 ## Profile
 
 ```bash
 docker run --rm --runtime nvidia \
   -v "$PWD/profiling/results:/workspace/ges3vig/profiling/results" \
   ges3vig-jetson:latest \
-  python3 profiling/profile_jetson.py --mode modules --batch-sizes 1 4 \
-    --repeats 20 --csv profiling/results/jetson_modules.csv
+  python3 profiling/profile_jetson.py --mode sweep \
+    --csv profiling/results/jetson_sweep.csv
 ```
 
 See [`../profiling/README.md`](../profiling/README.md) for the modes and flags.

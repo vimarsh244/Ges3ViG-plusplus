@@ -68,15 +68,15 @@ jobs:
         run: |
           # Everything the Dockerfile COPYs must exist and survive .dockerignore
           for p in config ges3vig Imputer profiling setup.py train.py test.py \
-                   evaluate.py docker/wheels; do
+                   evaluate.py docker/wheels docker/verify_build.py; do
             [ -e "$p" ] || { echo "::error::missing build-context path: $p"; exit 1; }
           done
           echo "all COPY sources present"
 
-      - name: Profiler syntax + CLI
+      - name: Python syntax
         run: |
-          python -m py_compile profiling/profile_jetson.py
-          echo "profile_jetson.py compiles"
+          python -m py_compile profiling/profile_jetson.py docker/verify_build.py
+          echo "profile_jetson.py + verify_build.py compile"
 
       - name: Shellcheck build script
         run: |
@@ -133,6 +133,12 @@ jobs:
 
       - name: Build image natively
         run: IMAGE=ges3vig-jetson:ci ./docker/build_and_test_jetson.sh
+
+      - name: Verify CUDA extensions on real hardware
+        run: |
+          # On a real GPU this also executes a live CUDA rasterize, which the
+          # emulated cross-build cannot do.
+          docker run --rm --runtime nvidia ges3vig-jetson:ci python3 verify_build.py
 
       - name: Profile the model (random tensors)
         run: |
