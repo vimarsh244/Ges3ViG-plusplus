@@ -1,0 +1,151 @@
+name: Jetson image
+
+# Validates that the Jetson Orin image definition stays buildable.
+#
+# Two tiers, because a full arm64 build compiles MinkowskiEngine + pytorch3d
+# CUDA extensions under QEMU and takes hours on a GitHub-hosted runner:
+#
+#   validate  - always. Fast, no compiling: lints the Dockerfile, checks the
+#               profiler is syntactically valid and its CLI works.
+#   build     - the real cross-build. Only on demand (workflow_dispatch) or on
+#               a self-hosted Jetson runner, where it is native and quick.
+
+on:
+  push:
+    paths:
+      - "docker/**"
+      - "profiling/**"
+      - "ges3vig/**"
+      - "setup.py"
+      - ".github/workflows/jetson-docker.yml"
+  pull_request:
+    paths:
+      - "docker/**"
+      - "profiling/**"
+      - "ges3vig/**"
+      - "setup.py"
+      - ".github/workflows/jetson-docker.yml"
+  workflow_dispatch:
+    inputs:
+      full_build:
+        description: "Run the full arm64 cross-build (slow, ~hours under QEMU)"
+        type: boolean
+        default: false
+
+jobs:
+  # ── tier 1: cheap, always runs ─────────────────────────────────────────────
+  validate:
+    name: Validate Dockerfile + profiler
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Lint Dockerfile (buildx --check)
+        run: |
+          # `--check` exits non-zero on warnings too, and this job runs on amd64
+          # where an arm64 base always warns (InvalidBaseImagePlatform). So we
+          # capture the output and fail only on genuine errors.
+          docker buildx build --check -f docker/Dockerfile.jetson . > check.log 2>&1 || true
+          cat check.log
+          if grep -qiE "^ERROR|error:" check.log; then
+            echo "::error::Dockerfile check reported errors"; exit 1
+          fi
+          echo "no errors (platform warning is expected on amd64)"
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/Dockerfile.jetson
+          # DL3008/DL3013: we intentionally don't pin apt/pip versions here,
+          # the JetPack base image dictates them.
+          ignore: DL3008,DL3013,DL3003,DL3042
+          failure-threshold: error
+
+      - name: Build context sanity
+        run: |
+          # Everything the Dockerfile COPYs must exist and survive .dockerignore
+          for p in config ges3vig Imputer profiling setup.py train.py test.py \
+                   evaluate.py docker/wheels; do
+            [ -e "$p" ] || { echo "::error::missing build-context path: $p"; exit 1; }
+          done
+          echo "all COPY sources present"
+
+      - name: Profiler syntax + CLI
+        run: |
+          python -m py_compile profiling/profile_jetson.py
+          echo "profile_jetson.py compiles"
+
+      - name: Shellcheck build script
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -S error docker/build_and_test_jetson.sh
+          bash -n docker/build_and_test_jetson.sh
+
+  # ── tier 2: the real thing, on demand ──────────────────────────────────────
+  build-arm64:
+    name: Cross-build arm64 image
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && inputs.full_build
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          # the JetPack base + CUDA toolchain need a lot of room
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.jetson
+          platforms: linux/arm64
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── tier 3: native build + real profiling run on a Jetson ──────────────────
+  # Enable by registering a Jetson Orin as a self-hosted runner with these
+  # labels. Skipped automatically everywhere else.
+  build-native-jetson:
+    name: Native build + profile on Jetson
+    needs: validate
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, ARM64, jetson]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image natively
+        run: IMAGE=ges3vig-jetson:ci ./docker/build_and_test_jetson.sh
+
+      - name: Profile the model (random tensors)
+        run: |
+          mkdir -p profiling/results
+          docker run --rm --runtime nvidia \
+            -v "$PWD/profiling/results:/workspace/ges3vig/profiling/results" \
+            ges3vig-jetson:ci \
+            python3 profiling/profile_jetson.py --mode modules \
+              --batch-sizes 1 4 --repeats 20 \
+              --csv profiling/results/jetson_modules.csv
+
+      - name: Upload timings
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetson-profile
+          path: profiling/results/

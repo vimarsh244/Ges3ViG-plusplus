@@ -1,0 +1,82 @@
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+
+# working directory inside the container
+WORKDIR /workspace/ges3vig
+
+# install system-level dependencies needed for building cuda extensions and minkowskiengine
+# also install x11 libraries required by open3d (even in headless mode)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        build-essential \
+        cmake \
+        libopenblas-dev \
+        libx11-6 \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# set cuda environment variables before building any cuda-dependent packages
+# the base image (-devel variant) includes cuda 12.4 toolkit with nvcc at /usr/local/cuda
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# set CUDA architectures for torch compilation (RTX 4000 Ada = 8.9)
+# this prevents the "list index out of range" error when no GPUs are visible during build
+ENV TORCH_CUDA_ARCH_LIST="8.9"
+
+# Force CUDA build for MinkowskiEngine even if GPU is not available during build
+ENV FORCE_CUDA=1
+
+# Set OMP_NUM_THREADS to avoid warnings and set default parallelism
+ENV OMP_NUM_THREADS=16
+
+# install python dependencies that are easiest via pip inside the image
+# pytorch + cuda are already provided by the base image
+# pytorch3d does not have a matching wheel for this pytorch/cuda combo on pip,
+# so we install it from source as recommended in the official INSTALL docs:
+# https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md
+RUN pip install --no-cache-dir \
+        fvcore \
+        iopath \
+        "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+
+# print output of nvcc --version to user building the docker image
+RUN nvcc --version 
+
+
+# install minkowskiengine with cuda support
+# matching the build method from CiSong10's official dockerfile:
+# https://github.com/CiSong10/MinkowskiEngine/blob/cuda12-installation/docker/Dockerfile
+ENV TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
+
+RUN git clone https://github.com/CiSong10/MinkowskiEngine.git \
+    && cd MinkowskiEngine \
+    && git checkout cuda12-installation \
+    # Apply the fix for error: Compilation: compiler finds both std::to_address and cuda::std::to_address
+    # Reference: https://github.com/NVIDIA/MinkowskiEngine/issues/596
+    # This patch is required for GCC 11+ which is present in the base image
+    && sed -i 's/\bauto __raw = __to_address(__r.get());/auto __raw = std::__to_address(__r.get());/' /usr/include/c++/11/bits/shared_ptr_base.h \
+    # The official dockerfile uses --force_cuda flag with setup.py install
+    && python setup.py install --force_cuda --blas=openblas \
+    && cd .. \
+    && rm -rf MinkowskiEngine
+
+# copy the project into the image
+COPY ./config ./config
+COPY ./ges3vig ./ges3vig
+COPY ./Imputer ./Imputer
+COPY ./train.py ./train.py
+COPY ./setup.py ./setup.py
+COPY ./evaluate.py ./evaluate.py
+COPY ./test.py ./test.py
+COPY ./tools ./tools
+
+# install this repo in editable mode
+RUN pip install --no-cache-dir -e .
+
+# build ges3vig cuda extensions
+RUN cd ges3vig/common_ops && pip install --no-cache-dir .
+
+# default command: override this in `docker run` as needed
+CMD ["python", "train.py", "--help"]

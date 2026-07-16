@@ -70,3 +70,11 @@ dataset/scanrefer/val_imputed_newer/
 dataset/scanrefer/points/
 dataset/humans/*
 benchmark
+
+# Jetson docker build: keep the wheel drop-directory tracked (the generic
+# `wheels/` rule above would hide it, and the Dockerfile COPYs it)
+!docker/wheels/
+docker/wheels/*.whl
+
+# profiler results
+profiling/results/

@@ -1,0 +1,40 @@
+# Keep the Jetson build context small & reproducible.
+# The image only needs: config/ ges3vig/ Imputer/ profiling/ setup.py *.py
+# plus docker/wheels/.
+
+.git
+.github
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# data / experiment artifacts (huge, never needed to build)
+output/
+dataset/
+docs/
+wandb/
+lightning_logs/
+*.ckpt
+*.pth
+*.hdf5
+*.h5
+*.p
+*.zip
+*.log
+temp.txt
+
+# local envs
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+
+# scratch / results
+scripts/
+*.csv
+*.json.gz

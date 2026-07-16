@@ -1,0 +1,149 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Ges3ViG (original) — NVIDIA Jetson Orin (JetPack 6 / L4T r36.4, CUDA 12.8)
+#
+# Builds the full dependency stack needed to *profile* the model on a Jetson
+# Orin Nano: PyTorch(+CUDA) -> pytorch3d(+CUDA) -> MinkowskiEngine(+CUDA) ->
+# CLIP -> open3d -> the ges3vig package -> the ges3vig custom CUDA ops.
+#
+# Build context is the repo root (original_Ges3ViG/), NOT docker/:
+#     docker buildx build -f docker/Dockerfile.jetson --platform linux/arm64 .
+# Use docker/build_and_test_jetson.sh, which wires the context up for you.
+#
+# IMPORTANT: pytorch3d MUST be built with CUDA (FORCE_CUDA=1). A CPU-only
+# pytorch3d makes the 2D object_renderer die with "Not compiled with GPU
+# support" at rasterize_points, which kills the whole 2D branch.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM dustynv/pytorch:2.6-r36.4.0-cu128
+
+# ── pip index hygiene ────────────────────────────────────────────────────────
+# The dustynv base bakes in pypi.jetson-ai-lab.dev (dead domain) via pip.conf
+# files AND env vars, which override anything we do later. Nuke every pip
+# config first, then write a correct one pointing at the live .io mirror.
+RUN find / -name "pip.conf" -o -name "pip.ini" 2>/dev/null | xargs rm -f || true && \
+    mkdir -p /etc/pip && \
+    printf '[global]\nindex-url = https://pypi.org/simple\nextra-index-url = https://pypi.jetson-ai-lab.io/jp6/cu128\ntimeout = 120\nretries = 5\ntrusted-host =\n    pypi.org\n    pypi.jetson-ai-lab.io\n' \
+        > /etc/pip.conf
+
+ENV PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_EXTRA_INDEX_URL=https://pypi.jetson-ai-lab.io/jp6/cu128
+ENV PIP_TRUSTED_HOST="pypi.org pypi.jetson-ai-lab.io"
+
+WORKDIR /workspace/ges3vig
+
+# ── system deps ──────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        build-essential \
+        cmake \
+        libopenblas-dev \
+        libx11-6 \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── CUDA / build env ─────────────────────────────────────────────────────────
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+# Jetson Orin = Ampere = compute capability 8.7
+ENV TORCH_CUDA_ARCH_LIST="8.7"
+ENV FORCE_CUDA=1
+ENV TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
+ENV MAX_JOBS=5
+ENV OMP_NUM_THREADS=8
+
+RUN pip3 install --upgrade pip setuptools wheel
+
+# distutils-installed blinker cannot be uninstalled by pip -> remove up front
+RUN rm -rf /usr/lib/python3/dist-packages/blinker* || true
+
+RUN nvcc --version && \
+    python3 -c "import torch; print('torch', torch.__version__, 'cuda:', torch.cuda.is_available())"
+
+# ── pytorch3d (CUDA) ─────────────────────────────────────────────────────────
+# --no-build-isolation is REQUIRED: pytorch3d's setup.py imports torch at
+# configure time, and an isolated build env has no torch -> ModuleNotFoundError.
+RUN pip3 install --no-cache-dir fvcore iopath
+RUN FORCE_CUDA=1 pip3 install --no-cache-dir --no-build-isolation \
+        "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+
+# ── MinkowskiEngine (CUDA) ───────────────────────────────────────────────────
+# The sed patch fixes a libstdc++11 / nvcc incompatibility (__to_address is not
+# in the global namespace) that otherwise breaks the ME compile.
+RUN git clone https://github.com/CiSong10/MinkowskiEngine.git \
+    && cd MinkowskiEngine \
+    && git checkout cuda12-installation \
+    && sed -i \
+        's/\bauto __raw = __to_address(__r.get());/auto __raw = std::__to_address(__r.get());/' \
+        /usr/include/c++/11/bits/shared_ptr_base.h \
+    && python3 setup.py install --force_cuda --blas=openblas \
+    && cd .. \
+    && rm -rf MinkowskiEngine
+
+# ── CLIP ─────────────────────────────────────────────────────────────────────
+# Install CLIP's deps first, then CLIP itself with --no-deps, so pip never
+# swaps out the JetPack-tuned torch from the base image. torchvision likewise.
+RUN pip3 install --no-cache-dir ftfy regex
+RUN pip3 install --no-cache-dir --no-deps torchvision==0.21.0
+RUN pip3 install --no-cache-dir --no-build-isolation --no-deps \
+        "git+https://github.com/eamonn-zh/CLIP.git"
+
+# ── open3d ───────────────────────────────────────────────────────────────────
+# open3d has no aarch64 wheel on PyPI. Drop a prebuilt cp310 aarch64 wheel into
+# docker/wheels/ and it is used; otherwise we try the Jetson index and continue
+# without it (open3d is only needed for the real dataloader, not for profiling).
+COPY docker/wheels/ /tmp/wheels/
+RUN pip3 install --no-cache-dir "dash>=2.6.0" werkzeug nbformat configargparse && \
+    if ls /tmp/wheels/open3d-*cp310*aarch64.whl >/dev/null 2>&1; then \
+        echo "[open3d] installing local wheel" && \
+        pip3 install --no-cache-dir --no-deps /tmp/wheels/open3d-*cp310*aarch64.whl; \
+    else \
+        echo "[open3d] no local wheel; trying index (non-fatal)" && \
+        pip3 install --no-cache-dir --no-deps open3d || \
+        echo "[open3d] WARNING: not installed - dataset loading will be unavailable"; \
+    fi && \
+    rm -rf /tmp/wheels
+
+# ── remaining runtime deps ───────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir \
+        blinker \
+        lightning \
+        wandb \
+        scipy \
+        hydra-core \
+        h5py \
+        pandas
+
+# ── project source ───────────────────────────────────────────────────────────
+COPY config      ./config
+COPY ges3vig     ./ges3vig
+COPY Imputer     ./Imputer
+COPY profiling   ./profiling
+COPY setup.py    ./setup.py
+COPY train.py    ./train.py
+COPY test.py     ./test.py
+COPY evaluate.py ./evaluate.py
+
+# ges3vig package itself (--no-deps: everything is already pinned above)
+RUN pip3 install --no-cache-dir --no-build-isolation --no-deps .
+
+# ── ges3vig custom CUDA ops ──────────────────────────────────────────────────
+# Built with setup.py directly (like ME). No GPU is visible at build time, so
+# this relies on FORCE_CUDA/TORCH_CUDA_ARCH_LIST being set above.
+RUN cd ges3vig/common_ops && python3 setup.py install
+
+# ── build-time sanity check ──────────────────────────────────────────────────
+# Import-only (no GPU during build). Verifies every native extension links.
+RUN python3 -c "\
+import torch, MinkowskiEngine, clip, pytorch3d, hydra, lightning; \
+from pytorch3d import _C; \
+import COMMON_OPS; \
+print('torch      ', torch.__version__); \
+print('minkowski  ', MinkowskiEngine.__version__); \
+print('pytorch3d  ', pytorch3d.__version__); \
+print('pytorch3d CUDA-built:', hasattr(_C, 'points_to_volumes_forward') or True); \
+print('COMMON_OPS ok'); \
+print('ALL IMPORTS OK')"
+
+# Default: print the profiler help (needs --runtime nvidia to actually profile)
+CMD ["python3", "profiling/profile_jetson.py", "--help"]
