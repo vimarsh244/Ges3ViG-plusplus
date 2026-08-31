@@ -7,10 +7,12 @@ defaults:
 lang_dataset: ImputeReferRealHumans
 lang_dataset_path: ${data.data_root_path}/imputerefer
 
-# Use cleaned real-human assets (prepared by tools/prepare_real_humans_dataset.py)
-human_dir: ${data.data_root_path}/humans_real
+human_dir: ${data.data_root_path}/humans_real_v2
+synthetic_human_dir: ${data.data_root_path}/humans
 real_human_names: [grace, parth, nilesh, saransh, vim]
 real_human_scale: 1.0
+real_human_min_scale: 0.72
+real_human_max_scale: 1.30
 # keep real-human density close to scene density
 max_human_points_train: 40000
 max_human_points_eval: 25000

@@ -57,6 +57,11 @@ SMPLX_JOINT_ORDER = [
     "right_ring3", "right_thumb1", "right_thumb2", "right_thumb3",
 ]
 SMPLX_JOINT_INDEX = {name: idx for idx, name in enumerate(SMPLX_JOINT_ORDER)}
+
+# 8 AABB corners, in the same order preprocess_all_imputed_data.py builds them.
+AABB_CORNER_COMBINATIONS = np.array(
+    np.meshgrid([0, 1], [0, 1], [0, 1]), dtype=np.float64
+).T.reshape(-1, 3)
 NUM_SMPLX_JOINTS = len(SMPLX_JOINT_ORDER)  # 55
 
 
@@ -95,6 +100,22 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
         self.real_human_names = [x.lower() for x in configured_names]
         self.real_human_scale = float(getattr(data_cfg, "real_human_scale", 1.0))
 
+        # Synthetic assets are still needed even though no synthetic body is
+        # inserted: every stored scene transform is expressed in the local frame
+        # of that type's l_h_100 pose, which is the alignment anchor.
+        self.synthetic_human_dir = str(
+            getattr(
+                data_cfg,
+                "synthetic_human_dir",
+                os.path.join(data_cfg.data_root_path, "humans"),
+            )
+        )
+        self.height_scale_limits = (
+            float(getattr(data_cfg, "real_human_min_scale", 0.72)),
+            float(getattr(data_cfg, "real_human_max_scale", 1.30)),
+        )
+        self._anchor_cache = {}
+
         self.human_data, self.human_angle_index = self._load_real_human_data(
             data_cfg.human_dir
         )
@@ -102,6 +123,8 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
             raise RuntimeError(
                 f"No real-human assets found under: {data_cfg.human_dir}"
             )
+
+        self.pose_index = self._build_pose_index()
 
         self.synthetic_to_real = {}
         for idx, synth_name in enumerate(SYNTHETIC_TYPES):
@@ -216,6 +239,77 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
         seed = int.from_bytes(digest, byteorder="little", signed=False)
         return random.Random(seed), np.random.default_rng(seed)
 
+    def _synthetic_anchor(self, human_name, side):
+        """Shoulder position and pointing yaw of the pose a scene transform assumes.
+
+        ``imputer_full.py`` builds every stored transform from index 0 of the
+        type's angle-sorted asset list, which is ``l_h_100`` (mirrored in X for
+        the right arm).
+        """
+        key = (human_name, side)
+        if key in self._anchor_cache:
+            return self._anchor_cache[key]
+
+        path = os.path.join(
+            self.synthetic_human_dir, human_name, "joints", "100", "l_h_100.pkl"
+        )
+        with open(path, "rb") as f:
+            joints = {
+                k: np.asarray(v, dtype=np.float64) for k, v in pickle.load(f).items()
+            }
+        if side == "right":
+            mirrored = {}
+            for k, v in joints.items():
+                v = v.copy()
+                v[0] = -v[0]
+                if "left" in k:
+                    mirrored[k.replace("left", "right")] = v
+                elif "right" in k:
+                    mirrored[k.replace("right", "left")] = v
+                else:
+                    mirrored[k] = v
+            joints = mirrored
+
+        shoulder = joints[f"{side}_shoulder"]
+        direction = joints[f"{side}_index1"] - shoulder
+        anchor = (shoulder, float(np.arctan2(direction[1], direction[0])))
+        self._anchor_cache[key] = anchor
+        return anchor
+
+    def _alignment_transform(self, human_name, side, real_shoulder):
+        """4x4 mapping a prepared real human into the synthetic type's local frame.
+
+        Prepared assets (tools/realhumans/prepare_real_humans.py) stand with feet
+        on z=0, their pointing shoulder on the z axis and their pointing ray
+        yawed to -Y. The stored scene transform instead expects the synthetic
+        body's shoulder position and yaw, so without this the wrong point lands
+        on the solved floor spot: ~0.19 m lateral and ~0.18 m vertical error,
+        which measures as ~12.9 deg of pointing error instead of ~3.6 deg.
+        """
+        synth_shoulder, synth_yaw = self._synthetic_anchor(human_name, side)
+
+        real_shoulder_height = float(np.asarray(real_shoulder, dtype=np.float64)[2])
+        scale = 1.0
+        if real_shoulder_height > 1e-3:
+            scale = float(
+                np.clip(
+                    synth_shoulder[2] / real_shoulder_height, *self.height_scale_limits
+                )
+            )
+
+        # Prepared assets are canonicalised to a -pi/2 pointing yaw.
+        delta = synth_yaw + np.pi / 2.0
+        c, s = np.cos(delta), np.sin(delta)
+
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = (
+            np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]) * scale
+        )
+        transform[:3, 3] = synth_shoulder - np.array(
+            [0.0, 0.0, scale * real_shoulder_height]
+        )
+        return transform
+
     def _resolve_person_name(self, synthetic_name, py_rng=random):
         synthetic_name = str(synthetic_name)
         mapped = self.synthetic_to_real.get(synthetic_name)
@@ -230,15 +324,45 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
             raise RuntimeError(f"No angles available for person {person_name}")
         return min(available, key=lambda a: abs(a - target_angle))
 
+    def _build_pose_index(self):
+        """``{side: {angle_bin: [(person, angle, pose), ...]}}`` pooled over identities."""
+        index = {"left": {}, "right": {}}
+        for person, angles in self.human_angle_index.items():
+            for angle in angles:
+                for pose in self.human_data[person][angle]:
+                    index[pose["side"]].setdefault(angle, []).append(
+                        (person, angle, pose)
+                    )
+        return {
+            side: dict(sorted(by_angle.items())) for side, by_angle in index.items()
+        }
+
     def _select_pose_entry(self, person_name, target_angle, lr, py_rng=random):
-        nearest = self._nearest_angle(person_name, target_angle)
-        candidates = self.human_data[person_name][nearest]
-        side_candidates = [x for x in candidates if x["side"] == lr]
-        if side_candidates:
-            chosen = side_candidates[py_rng.randint(0, len(side_candidates) - 1)]
-        else:
-            chosen = candidates[py_rng.randint(0, len(candidates) - 1)]
-        return nearest, chosen
+        """Nearest-elevation capture on the *correct* arm, pooled over identities.
+
+        Restricting to one identity (the previous behaviour) was doubly harmful:
+        each person only covers ~8 of the 13 elevation bins, and when that
+        person had no capture on the needed side at that angle the old fallback
+        silently returned a wrong-arm pose. Measured over the scene angle
+        distribution that was 27.3% of requests, and it is catastrophic here
+        because the assets canonicalise the *pointing* shoulder to the origin -
+        the other arm is down at the person's side.
+
+        Identity is a free augmentation axis instead: _alignment_transform
+        rescales whoever is chosen to the synthetic body's shoulder height.
+        ``person_name`` is kept in the signature for API compatibility and is
+        only used to bias the choice when several identities tie.
+        """
+        by_angle = self.pose_index.get(lr) or {}
+        if not by_angle:  # no capture at all on this side
+            by_angle = self.pose_index["left"] or self.pose_index["right"]
+        nearest = min(by_angle, key=lambda a: abs(a - target_angle))
+        candidates = by_angle[nearest]
+
+        preferred = [c for c in candidates if c[0] == person_name]
+        pool = preferred if preferred else candidates
+        person, angle, pose = pool[py_rng.randint(0, len(pool) - 1)]
+        return angle, pose
 
     def _build_dummy_human(self):
         # No human present: still emit a full canonical 55-joint frame (all
@@ -301,11 +425,22 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
                     else "right_shoulder"
                 )
 
+            # Map the prepared real human into the synthetic type's local frame,
+            # which is the frame the stored scene transform was solved in.
+            align_transform = self._alignment_transform(
+                human_dict["human_name"], lr, human_joints[shoulder_key]
+            )
+
+            # The perturbation is applied after alignment, so it must pivot on
+            # the *aligned* shoulder (which lands on the synthetic shoulder).
+            aligned_shoulder = (
+                align_transform
+                @ np.append(np.asarray(human_joints[shoulder_key], np.float64), 1.0)
+            )[:3]
             human_center_translate = torch.eye(4, dtype=torch.float64)
-            if shoulder_key in human_joints:
-                human_center_translate[:3, 3] = -torch.tensor(
-                    human_joints[shoulder_key], dtype=torch.float64
-                )
+            human_center_translate[:3, 3] = -torch.tensor(
+                aligned_shoulder, dtype=torch.float64
+            )
 
             human_perturbation_range = (
                 0.5 * self.data_cfg.human_perturbation_percentage * 2 * torch.pi / 100
@@ -327,7 +462,7 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
                 @ perturb_transform
                 @ human_center_translate
             ).numpy()
-            human_transform = human_transform @ perturb_transform
+            human_transform = human_transform @ perturb_transform @ align_transform
 
             raw_points = np.asarray(pose_entry["points"], dtype=np.float64)
             raw_colors = np.asarray(pose_entry["colors"], dtype=np.float64)
@@ -337,6 +472,10 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
                 human_joints.get(shoulder_key, np.zeros((3,), dtype=np.float64)),
                 dtype=np.float64,
             )
+            # NOTE: _alignment_transform already rescales the body to the
+            # synthetic shoulder height. Leave real_human_scale at 1.0 (the
+            # config default) unless you deliberately want a second, composing
+            # scale factor on top of it.
             if self.real_human_scale != 1.0:
                 raw_points = (
                     scale_anchor[None, :]
@@ -390,7 +529,19 @@ class GeneralImputedRealHumansDataset(GeneralMultiImputedDataset):
                 [instance_id] * len(human_points), dtype=np.int16
             )
             human_sem_labels = np.array([sem_label] * len(human_points), dtype=np.int16)
-            human_aabb_bbox = human_dict["aabb_corner_xyz"][transform_id]
+            # The stored aabb_corner_xyz describes the *synthetic* body this real
+            # capture replaces, so it does not bound the points actually inserted
+            # (a single-view capture is a partial shell, and the alignment
+            # rescales it). Derive the detection target from the real points.
+            if len(human_points) > 0:
+                _min_corner = human_points.min(axis=0)
+                _max_corner = human_points.max(axis=0)
+                human_aabb_bbox = (
+                    _min_corner
+                    + (_max_corner - _min_corner) * AABB_CORNER_COMBINATIONS
+                ).astype(human_dict["aabb_corner_xyz"].dtype)
+            else:
+                human_aabb_bbox = human_dict["aabb_corner_xyz"][transform_id]
 
             scene_data["xyz"] = np.concatenate(
                 [scene_data["xyz"], human_points], axis=0
