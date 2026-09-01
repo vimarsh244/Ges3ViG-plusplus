@@ -1,11 +1,11 @@
-# Jetson Orin container for Ges3ViG
+# Jetson Orin container for M3DRefCLIP
 
 Builds the whole native stack the model needs - PyTorch(+CUDA), **pytorch3d
-built with CUDA**, MinkowskiEngine, CLIP, open3d, and the ges3vig custom CUDA
+built with CUDA**, MinkowskiEngine, CLIP, open3d, and the m3drefclip custom CUDA
 ops - on top of NVIDIA's JetPack 6 / L4T r36.4 PyTorch base
 (`dustynv/pytorch:2.6-r36.4.0-cu128`, CUDA 12.8, Python 3.10).
 
-Target: **Jetson Orin Nano** (Ampere, `TORCH_CUDA_ARCH_LIST=8.7`).
+Target: **Jetson Orin AGX** (Ampere, `TORCH_CUDA_ARCH_LIST=8.7`).
 
 ## Build
 
@@ -82,8 +82,8 @@ non-obvious way.
 ## open3d
 
 open3d has no aarch64 PyPI wheel. Drop a **cp310** aarch64 wheel into
-`docker/wheels/` and the build uses it; the build script auto-stages the copy
-already in this checkout (`../Ges3ViG/open3d-0.19.0-cp310-...whl`).
+`docker/wheels/` and the build uses it; the build script uses it automatically. The expected filename is
+`open3d-0.19.0-cp310-cp310-manylinux_2_35_aarch64.whl`.
 
 No wheel is fine: the build falls back to the Jetson index and, failing that,
 continues without open3d - it's only needed for the real dataloader, not for the
@@ -93,7 +93,7 @@ random-tensor profiler. See [`wheels/README.md`](wheels/README.md).
 
 [`.github/workflows/jetson-docker.yml`](../.github/workflows/jetson-docker.yml)
 
-* **validate** (every push/PR touching docker/profiling/ges3vig): lints the
+* **validate** (every push/PR touching docker/profiling/m3drefclip): lints the
   Dockerfile (`buildx --check` + hadolint), checks every `COPY` source survives
   `.dockerignore`, compiles the profiler, shellchecks the build script. Fast, no
   compiling.

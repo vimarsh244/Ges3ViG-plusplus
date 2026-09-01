@@ -1,5 +1,5 @@
 # Keep the Jetson build context small & reproducible.
-# The image only needs: config/ ges3vig/ Imputer/ profiling/ setup.py *.py
+# The image only needs: m3drefclip_config/ m3drefclip/ profiling/ setup.py
 # plus docker/wheels/.
 
 .git

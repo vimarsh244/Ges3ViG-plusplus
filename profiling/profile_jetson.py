@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Per-layer / per-module latency profiler for the ORIGINAL Ges3ViG model.
+Per-layer / per-module latency profiler for the published M3DRefCLIP model.
 
 Goal
 ----
 Measure how long a single forward pass takes for every module of the network
-(vision 3D detector, human processor, 2D vision/CLIP image encoder, text encoder,
-gesture/joint module, cross-modal fusion/match module ...) plus the end-to-end
-total, so we can understand where the time goes on an NVIDIA Jetson Orin Nano.
+(vision 3D detector, 2D vision/CLIP image encoder, text encoder,
+cross-modal fusion/match module ...) plus the end-to-end
+total, so we can understand where the time goes on an NVIDIA Jetson Orin AGX.
 
 It is deliberately self-contained: it drives the model with **random tensors**
 (no dataset required), warms up, then times several passes and averages.
@@ -36,7 +36,7 @@ Both modes:
 
 Examples
 --------
-    PY=/nas_hcfc/vimarsh/HRI/miniconda3/envs/ges3vig-gpu/bin/python
+    PY=python3
 
     # per-module micro-benchmark, bs=1 and bs=4, 30 timed passes
     $PY profiling/profile_jetson.py --mode modules --batch-sizes 1 4 --repeats 30
@@ -189,11 +189,11 @@ def move(obj, device):
 
 
 def load_cfg(data_override):
-    """Compose the Hydra config the same way test.py does (no CLI runner)."""
+    """Compose the unmodified upstream M3DRefCLIP config (no CLI runner)."""
     from hydra import compose, initialize_config_dir
-    cfg_dir = os.path.join(PROJECT_ROOT, "config")
+    cfg_dir = os.path.join(PROJECT_ROOT, "m3drefclip_config")
     with initialize_config_dir(config_dir=cfg_dir, version_base=None):
-        cfg = compose(config_name="global_imputed_config",
+        cfg = compose(config_name="global_config",
                       overrides=[f"data={data_override}"])
     return cfg
 
@@ -318,13 +318,12 @@ def make_synthetic_module_inputs(model, cfg, device, B, num_proposals):
     heads = int(net.matching_module.head)                 # 4
     det_ch = int(net.detector.output_channel)             # 32
     img_ch = int(net.clip_img_encoder.output_channel)     # 128
-    num_joints = int(getattr(model.human_processor, "num_joints", 55))
     views = len(net.object_renderer.eye)                  # 3
     img_size = int(net.object_renderer.rasterizer_setting.image_size)  # 224
     match_in = det_ch * int(net.use_3d_features) + int(net.use_2d_feature) * img_ch  # 160
-    # word sequence length = CLIP text tokens (77) + gesture/joint tokens
+    # M3DRefCLIP uses the CLIP text-token sequence directly.
     ctx = 77
-    word_len = ctx + num_joints
+    word_len = ctx
 
     builders = {}
 
@@ -346,12 +345,6 @@ def make_synthetic_module_inputs(model, cfg, device, B, num_proposals):
         return lambda: model.text_encoder(dd, od)
     builders["text_encoder (language/CLIP)"] = (_text, f"{B}x{chunk} sentences of {ctx} tokens")
 
-    # ── gesture stream: joint self-attention module ──
-    def _joint():
-        jf = torch.randn(B, num_joints, feat, device=device)
-        return lambda: model.joint_module(jf)
-    builders["joint_module (gesture attn)"] = (_joint, f"{B}x{num_joints}x{feat}")
-
     # ── cross-modal fusion: match module ──
     def _match():
         od = {
@@ -368,20 +361,6 @@ def make_synthetic_module_inputs(model, cfg, device, B, num_proposals):
         }
         return lambda: model.match_module(dd, od)
     builders["match_module (cross-modal fusion)"] = (_match, f"{B}x{K} prop, {word_len} word tok")
-
-    # ── human processor (feasible with random per-point tensors) ──
-    def _human():
-        # enough points that >300 land on the human class after random argmax
-        npts = 30000
-        pxyz = torch.rand(npts, 3, device=device) * 4.0
-        pfeat = torch.randn(npts, det_ch, device=device)
-        vbatch = torch.randint(0, B, (npts,), device=device, dtype=torch.uint8)
-        # bias the semantic scores so the human class is well represented
-        sem = torch.randn(npts, int(cfg.data.semantic_class), device=device)
-        human_label = model.human_processor.human_label
-        sem[:, human_label] += 1.5
-        return lambda: model.human_processor(pxyz, pfeat, vbatch, sem, B)
-    builders["human_processor"] = (_human, f"{B} scenes, 30k pts of {det_ch}ch")
 
     return builders
 
@@ -440,21 +419,13 @@ def synthesize_data_dict(cfg, device, num_points, batch_size, seed=0, keep_ratio
     use_rgb = bool(cfg.data.point_features.use_rgb)
     use_normal = bool(cfg.data.point_features.use_normal)
     voxel_size = float(cfg.data.voxel_size)
-    num_joints = 55
+    use_multiview = bool(cfg.data.point_features.use_multiview)
 
     per_scene = max(2000, num_points)
     voxel_xyz_list, voxel_feats_list, voxel_point_map_list = [], [], []
     point_xyz_all, point_rgb_all, vert_batch_ids = [], [], []
-    joint_name_idx_map = []
     all_point_count_offsets = [0]
     num_voxel_batch = 0
-
-    # joint layout the pointing-bias code indexes into
-    joint_names = ["left_shoulder", "right_shoulder", "left_index1", "right_index1"]
-    name_map = {n: i for i, n in enumerate(joint_names)}
-    # pad the rest of the joints with unique indices
-    for i in range(len(joint_names), num_joints):
-        name_map[f"joint_{i}"] = i
 
     for b in range(batch_size):
         # a handful of dense blobs => the ball-query/bfs clustering finds proposals
@@ -480,6 +451,9 @@ def synthesize_data_dict(cfg, device, num_points, batch_size, seed=0, keep_ratio
         if use_normal:
             nrm = rng.normal(0, 1, size=(n, 3)).astype(np.float32)
             feats = np.concatenate((feats, nrm), axis=1)
+        if use_multiview:
+            multiview = rng.normal(0, 1, size=(n, 128)).astype(np.float32)
+            feats = np.concatenate((feats, multiview), axis=1)
         feats = np.concatenate((feats, pxyz), axis=1)  # + xyz, exactly like the dataset
 
         v_xyz, v_feats, _, v_p2v = ME.utils.sparse_quantize(
@@ -494,7 +468,6 @@ def synthesize_data_dict(cfg, device, num_points, batch_size, seed=0, keep_ratio
         point_xyz_all.append(torch.from_numpy(pxyz))
         point_rgb_all.append(torch.from_numpy(rgb))
         vert_batch_ids.append(torch.full((n,), b, dtype=torch.uint8))
-        joint_name_idx_map.append(name_map)
         all_point_count_offsets.append(all_point_count_offsets[-1] + n)
 
     voxel_xyz, voxel_features = ME.utils.sparse_collate(
@@ -516,7 +489,6 @@ def synthesize_data_dict(cfg, device, num_points, batch_size, seed=0, keep_ratio
         "ann_id": torch.zeros(batch_size, chunk, dtype=torch.long),
         "object_id": torch.zeros(batch_size, chunk, dtype=torch.long),
         "clip_tokens": torch.randint(0, 49407, (batch_size, chunk, 77), dtype=torch.long),
-        "joint_name_idx_map": joint_name_idx_map,
         "scene_center_xyz": torch.zeros(batch_size, 3),
     }
     return move(dd, device)
@@ -562,8 +534,8 @@ class LayerTimer:
         self.handles.clear()
 
 
-TOP_STAGES = ["detector", "human_processor", "object_renderer", "clip_image",
-              "text_encoder", "joint_module", "match_module"]
+TOP_STAGES = ["detector", "object_renderer", "clip_image", "text_encoder",
+              "match_module"]
 
 
 def get_batch(cfg, device, args, batch_size, num_points, keep_ratio=1.0):
@@ -667,7 +639,7 @@ def run_full_mode(model, cfg, device, args):
 
     print_table(f"Per-stage latency (ms)  |  batch_size = {batch_size}  |  "
                 f"{args.repeats} passes (after {args.warmup} warmup)", stage_rows)
-    print(f"{'(non-module ops: bias/dense-convert/einsum)':<{LABEL_W}}{other_ms:>9.3f}")
+    print(f"{'(non-module ops: pooling/dense-convert)':<{LABEL_W}}{other_ms:>9.3f}")
     print(f"{'  stages + other (hooked pass)':<{LABEL_W}}"
           f"{stage_pass_stats['mean_ms']:>9.3f}")
     table_row("TOTAL forward (unhooked, authoritative)", total_stats)
@@ -850,9 +822,9 @@ def parse_args():
                         "full = whole-model per-layer+stage+total; "
                         "sweep = auto-run every case (points/dropout/foveation/batch) "
                         "and store one combined CSV")
-    p.add_argument("--data", default="noelbowimputerefer",
+    p.add_argument("--data", default="scanrefer",
                    help="Hydra data config to compose (only sets model shapes; "
-                        "no dataset is read). Default: noelbowimputerefer")
+                        "no dataset is read). Default: scanrefer")
     p.add_argument("--ckpt", default=None,
                    help="optional checkpoint for real weights (latency is ~identical "
                         "with random weights)")
@@ -941,7 +913,7 @@ def main():
         print("[info] --skip-2d: 2D branch (object_renderer + clip_image) disabled")
 
     print("=" * TABLE_W)
-    print("Ges3ViG layer/module latency profiler")
+    print("M3DRefCLIP layer/module latency profiler")
     print(f"  device      : {device}"
           + (f" ({torch.cuda.get_device_name(0)})" if use_cuda else ""))
     print(f"  jetson      : {is_jetson()}")
