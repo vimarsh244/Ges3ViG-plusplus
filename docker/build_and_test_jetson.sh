@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Build (and optionally smoke-test) the Ges3ViG Jetson Orin image.
+# Build (and optionally smoke-test) the M3DRefCLIP Jetson Orin image.
 #
 # The image is arm64. On an arm64 Jetson it builds natively. On an x86_64 dev
 # box it cross-builds through QEMU emulation, which WORKS but is slow (the
@@ -130,7 +130,7 @@ if [ "$RUN_TEST" -eq 1 ]; then
     echo "== loading $OUTPUT_TAR into the local daemon for the test run ..."
     docker load -i "$OUTPUT_TAR"
   fi
-  echo "== running the profiler inside the container ..."
+  echo "== running the M3DRefCLIP profiler inside the container ..."
   docker run --rm --runtime nvidia --network host \
     -v "$REPO_ROOT/profiling/results:/workspace/ges3vig/profiling/results" \
     "$IMAGE" \

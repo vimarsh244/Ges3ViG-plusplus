@@ -1,9 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Ges3ViG (original) — NVIDIA Jetson Orin (JetPack 6 / L4T r36.4, CUDA 12.8)
+# M3DRefCLIP — NVIDIA Jetson Orin (JetPack 6 / L4T r36.4, CUDA 12.8)
 #
 # Builds the full dependency stack needed to *profile* the model on a Jetson
-# Orin Nano: PyTorch(+CUDA) -> pytorch3d(+CUDA) -> MinkowskiEngine(+CUDA) ->
-# CLIP -> open3d -> the ges3vig package -> the ges3vig custom CUDA ops.
+# Orin AGX: PyTorch(+CUDA) -> pytorch3d(+CUDA) -> MinkowskiEngine(+CUDA) ->
+# CLIP -> open3d -> the m3drefclip package -> its custom CUDA ops.
 #
 # Build context is the repo root (original_Ges3ViG/), NOT docker/:
 #     docker buildx build -f docker/Dockerfile.jetson --platform linux/arm64 .
@@ -115,22 +115,18 @@ RUN pip3 install --no-cache-dir \
         pandas
 
 # ── project source ───────────────────────────────────────────────────────────
-COPY config      ./config
-COPY ges3vig     ./ges3vig
-COPY Imputer     ./Imputer
-COPY profiling   ./profiling
-COPY setup.py    ./setup.py
-COPY train.py    ./train.py
-COPY test.py     ./test.py
-COPY evaluate.py ./evaluate.py
+COPY m3drefclip_config ./m3drefclip_config
+COPY m3drefclip        ./m3drefclip
+COPY profiling         ./profiling
+COPY setup.py          ./setup.py
 
-# ges3vig package itself (--no-deps: everything is already pinned above)
+# m3drefclip package itself (--no-deps: everything is already pinned above)
 RUN pip3 install --no-cache-dir --no-build-isolation --no-deps .
 
-# ── ges3vig custom CUDA ops ──────────────────────────────────────────────────
+# ── m3drefclip custom CUDA ops ──────────────────────────────────────────────────
 # Built with setup.py directly (like ME). No GPU is visible at build time, so
 # this relies on FORCE_CUDA/TORCH_CUDA_ARCH_LIST being set above.
-RUN cd ges3vig/common_ops && python3 setup.py install
+RUN cd m3drefclip/common_ops && python3 setup.py install
 
 # ── build-time sanity check ──────────────────────────────────────────────────
 # No GPU is visible during the build, so we cannot *run* a CUDA kernel here.

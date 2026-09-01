@@ -1,8 +1,10 @@
-# Profiling Ges3ViG on a Jetson Orin Nano
+# Profiling M3DRefCLIP on a Jetson Orin AGX
 
 `profile_jetson.py` measures **per-layer / per-module forward latency** of the
-original Ges3ViG model, driven by **random tensors** - no dataset, no checkpoint
-required. It warms up, times N passes, and reports
+published M3DRefCLIP model, driven by **random tensors** - no dataset, no checkpoint
+required.
+The model source and configs are vendored from `3dlg-hcvc/multi3drefer` at commit
+`cd5c23e1a997648c4906883458d86d3632d4a470`; no upstream remote is stored. It warms up, times N passes, and reports
 `mean / std / min / p50 / p90 / p95 / max` plus `fps`, for a single sample and
 for a batch.
 
@@ -80,8 +82,7 @@ Every measurement lands in one CSV with `case`, `param`, `num_points`,
 `keep_ratio`, `batch_size`, `kind` (stage/total/module), the latency stats and
 `fps`. Each case also prints a compact scan table.
 
-A note on **foveation**: the original model has no foveation logic (the
-`Ges3ViG/` fork does). So this case does *not* foveate the model - it measures
+A note on **foveation**: M3DRefCLIP has no foveation logic. This case does *not* foveate the model - it measures
 the **cost curve**: what the 2D encoder + fusion would cost if only *k*
 proposals were rendered. That tells you what foveation would buy before anyone
 implements it.
@@ -95,9 +96,7 @@ the shapes the config implies. It needs no scene geometry, so it runs anywhere:
 |---|---|---|
 | `clip_image` | 2D vision encoder (CLIP ViT-B/32) | `B×K×views` images of `3×224×224` |
 | `text_encoder` | language encoder (CLIP text) | `B×chunk` sentences of 77 tokens |
-| `joint_module` | gesture self-attention | `B×55×128` joint features |
-| `match_module` | cross-modal fusion | `B×80` proposals + `132` word tokens |
-| `human_processor` | joint regression / bias weights | 30k points × 32ch |
+| `match_module` | cross-modal fusion | `B×80` proposals + `77` word tokens |
 
 Use `--num-proposals` to set how many proposals per scene the 2D and fusion
 paths see (default 48; the model pads to `max_num_proposals=80`).
@@ -108,14 +107,14 @@ Synthesizes a **random point cloud** (dense Gaussian blobs, so the ball-query /
 BFS clustering actually forms proposals), voxelizes it *exactly* like the real
 dataloader, and runs the entire model. Forward hooks time:
 
-* every **stage** (`detector`, `human_processor`, `object_renderer`,
-  `clip_image`, `text_encoder`, `joint_module`, `match_module`),
+* every **stage** (`detector`, `object_renderer`, `clip_image`, `text_encoder`,
+  `match_module`),
 * the **TOTAL** forward,
 * the **slowest leaf layers** (`--top-layers`, default 25) - individual
   Minkowski convs, linears, etc.
 
 Whatever the stages don't account for is reported as *non-module ops*
-(pointing-bias loop, sparse→dense conversion, the final einsum).
+(pooling and sparse→dense conversion).
 
 To profile the *real* workload instead of a random one, pass a cached batch:
 
@@ -190,8 +189,7 @@ whole pipeline down with it - including `clip_image`, the most expensive module.
 If you are stuck on a host with a CPU-only pytorch3d, the profiler
 **auto-enables `--stub-renderer`**: rasterization is replaced by random images of
 the same shape, and `clip_image` + fusion still run for real. The reported total
-then **excludes rasterization cost** - which is ~21% of the forward, so treat
-those totals as a lower bound. It is a fallback, not the way to measure.
+then **excludes rasterization cost**, so treat those totals as a lower bound. It is a fallback, not the way to measure.
 
 ```bash
 # on a good env this runs the real renderer; on a broken one it stubs + warns
@@ -203,88 +201,3 @@ changes `match_module`'s input dims and skips the foveation case. Prefer the stu
 
 The **Jetson image builds pytorch3d from source with `FORCE_CUDA=1`**, so on the
 Jetson the renderer runs for real and no stub is applied.
-
-## Reference numbers (x86 RTX 4000 Ada, random weights, real renderer)
-
-Not Jetson numbers - a baseline to sanity-check the Jetson run against. The Orin
-Nano will be substantially slower. All from the default sweep command above, run
-on `/home/vim/miniconda3/envs/ges3vig-gpu` (CUDA pytorch3d, nothing stubbed).
-
-### Where the time goes (`--mode full`, 20k pts, bs=1)
-
-| stage | p50 (ms) | share |
-|---|---|---|
-| **`clip_image` (2D vision encoder)** | **109.4** | **51%** |
-| `detector` (PointGroup + Minkowski + clustering) | 50.9 | 24% |
-| **`object_renderer` (pytorch3d rasterize)** | **44.4** | **21%** |
-| `text_encoder` | 2.4 | |
-| `match_module` (fusion) | 1.0 | |
-| `human_processor` | 0.6 | |
-| `joint_module` | 0.3 | |
-| non-module ops (bias/dense-convert/einsum) | 1.1 | |
-| **TOTAL** | **~211.7** | **4.70 fps** |
-
-**The 2D branch (`object_renderer` + `clip_image`) is ~72% of the forward.**
-Inside the renderer, `rasterizer` is ~30ms and `compositor` ~5ms.
-
-### Point-count scan (`points`)
-
-The detector is ~linear in points; the total tracks it.
-
-| points | total ms | fps | detector ms |
-|---|---|---|---|
-| 10k | 150.1 | 6.66 | 41.3 |
-| 30k | 235.6 | 4.24 | 61.7 |
-| 50k | 289.1 | 3.46 | 88.7 |
-| 70k | 366.4 | 2.73 | 126.9 |
-| 90k | 449.7 | 2.22 | 182.1 |
-
-### Foveation cost curve (`foveation`) - 2D encoder + fusion only
-
-Dead linear in proposals. At the default 80 proposals the 2D branch alone costs
-more than the entire rest of the network.
-
-| proposals | 2D+fusion ms | fps |
-|---|---|---|
-| 80 | 258.7 | 3.87 |
-| 48 | 156.1 | 6.40 |
-| 32 | 99.8 | 10.02 |
-| 16 | 50.5 | 19.81 |
-| 8 | 25.3 | 39.49 |
-| 4 | 13.6 | 73.72 |
-| 1 | 5.0 | 200.40 |
-
-### Batch scan (`batch`) - per-scene throughput
-
-Batching helps a little; it does not change the picture.
-
-| batch | total ms | ms/scene | fps |
-|---|---|---|---|
-| 1 | 251.6 | 251.6 | 3.97 |
-| 2 | 477.6 | 238.8 | 4.19 |
-| 4 | 892.7 | 223.2 | 4.48 |
-
-### Dropout scan (`dropout`, 40k base)
-
-| keep | total ms | fps | detector ms |
-|---|---|---|---|
-| 1.0 | 253.0 | 3.95 | 72.2 |
-| 0.75 | 251.1 | 3.98 | 64.0 |
-| 0.5 | 208.6 | 4.79 | 54.4 |
-
-The **detector falls cleanly** (72.2 -> 64.0 -> 54.4) but the **total barely
-moves at keep=0.75** - dropping points also changes how many proposals the
-clustering emits, and the 2D cost is driven by proposal count, not point count.
-Dropout is a weak lever on end-to-end latency; foveation is the strong one.
-
-### What this says
-
-1. **The 2D branch is the bottleneck - ~72% of the forward** (`clip_image` 51% +
-   `object_renderer` 21%). It renders and encodes `proposals x 3 views` images
-   **per scene**. Attack this first.
-2. **The detector owns most of the rest** (~24%), almost all MinkowskiEngine
-   sparse convs in `score_net` / `backbone`, scaling with point count.
-3. **Everything else is noise** (<3% combined): text, fusion, gesture, human.
-4. Foveating to 16 proposals cuts the 2D branch ~5x (259 -> 50ms) - worth far
-   more than any point-cloud decimation. `original_Ges3ViG` has no foveation; the
-   `Ges3ViG/` fork implements it as `foveated_2d`.
